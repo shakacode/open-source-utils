@@ -1,0 +1,811 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "cgi"
+require "base64"
+require "fileutils"
+require "json"
+require "net/http"
+require "open3"
+require "set"
+require "time"
+require "uri"
+require "yaml"
+
+ROOT = File.expand_path(ENV.fetch("OSS_MONITOR_WORKSPACE", File.expand_path("..", __dir__)))
+STATE_PATH = File.join(ROOT, ".Codex", "oss-outside-activity-monitor-state.json")
+RESULT_PATH = File.join(ROOT, ".Codex", "oss-outside-activity-monitor-result.json")
+SLACK_WEBHOOK_PATH = File.expand_path("~/.codex/codex_slack_webhook_url")
+ORG = "shakacode"
+TEAM = "shakacode"
+TRUSTED_REPO = "react_on_rails"
+TRUSTED_EXPR = "main:.agents/trusted-github-actors.yml"
+TRUSTED_FILE_PATH = ".agents/trusted-github-actors.yml"
+TIMEOUT = "/opt/homebrew/bin/timeout"
+GH_TIMEOUT_SECONDS = "20"
+MAX_RETRIES = 3
+RETRY_DELAYS = [1, 2, 4]
+FIRST_RUN_DAYS = 60
+OVERLAP_SECONDS = 5 * 60
+REPORT_RETENTION_DAYS = 120
+HST_OFFSET = "-10:00"
+KNOWN_BOT_LOGIN_PREFIXES = [
+  "github-actions",
+  "dependabot",
+  "renovate",
+  "copilot-pull-request-reviewer",
+  "mergify",
+  "release-please",
+  "codex-automation",
+  "chatgpt-codex-connector",
+  "claude",
+  "coderabbitai",
+  "cursor",
+  "greptile-apps",
+  "codecov",
+  "snyk-ci",
+  "release-automation"
+].freeze
+STANDARD_OUTSIDE_REASON = "not in ShakaCode team allowlist or trusted actors file; actor type %<type>s."
+
+def with_retries
+  attempts = 0
+  begin
+    yield
+  rescue StandardError => e
+    attempts += 1
+    raise e if attempts >= MAX_RETRIES
+
+    sleep(RETRY_DELAYS[[attempts - 1, RETRY_DELAYS.length - 1].min])
+    retry
+  end
+end
+
+def gh_json(*args)
+  with_retries do
+    stdout, stderr, status = Open3.capture3(TIMEOUT, GH_TIMEOUT_SECONDS, "gh", "api", *args)
+    unless status.success?
+      error_message = stderr.to_s.strip
+      error_message = stdout.to_s.strip if error_message.empty?
+      raise "gh api #{args.join(" ")} failed: #{error_message} (exit=#{status.exitstatus})"
+    end
+
+    JSON.parse(stdout)
+  end
+end
+
+def paged_array(path)
+  page = 1
+  items = []
+
+  loop do
+    sep = path.include?("?") ? "&" : "?"
+    batch = gh_json("#{path}#{sep}per_page=100&page=#{page}")
+    raise "Expected array from #{path}" unless batch.is_a?(Array)
+
+    break if batch.empty?
+
+    items.concat(batch)
+    break if batch.length < 100
+    page += 1
+  end
+
+  items
+end
+
+def graphql_query(query, variables = {})
+  normalized_query = query.to_s.gsub(/\s+/, " ").strip
+  args = ["graphql", "-f", "query=#{normalized_query}"]
+  variables.each do |key, value|
+    args << "-f" << "#{key}=#{value}"
+  end
+  gh_json(*args)
+end
+
+def parse_time(value)
+  Time.parse(value.to_s).utc
+rescue StandardError
+  nil
+end
+
+def gq(value)
+  value.to_s.gsub("\\", "\\\\").gsub("\"", "\\\"")
+end
+
+def actor_login(actor)
+  actor && actor["login"].to_s
+end
+
+def actor_type(actor)
+  actor && (actor["type"] || actor["__typename"]).to_s
+end
+
+def outside_because(actor)
+  format(STANDARD_OUTSIDE_REASON, type: actor_type(actor))
+end
+
+def bot_actor?(login, type)
+  normalized = login.to_s.downcase
+  return true if type.to_s.casecmp("bot").zero?
+  return true if normalized.end_with?("[bot]")
+
+  KNOWN_BOT_LOGIN_PREFIXES.any? { |prefix| normalized == prefix || normalized.start_with?("#{prefix}[") }
+end
+
+def outside_actor?(actor, trusted)
+  login = actor_login(actor)
+  return false if login.empty?
+
+  normalized = login.downcase
+  return false if trusted.include?(normalized)
+  return false if bot_actor?(login, actor_type(actor))
+
+  true
+end
+
+def format_hst(time)
+  time.getlocal(HST_OFFSET).strftime("%Y-%m-%d %H:%M:%S") + " HST"
+end
+
+def add_item(items, reported_ids, id:, repository:, activity_type:, actor:, link:, summary:, outside_because:, action:)
+  return if reported_ids.include?(id)
+  return if link.to_s.empty?
+
+  items << {
+    id: id,
+    repository: repository,
+    activity_type: activity_type,
+    author: actor_login(actor),
+    actor_type: actor_type(actor),
+    link: link,
+    summary: summary.to_s.strip[0, 240],
+    outside_because: outside_because,
+    suggested_next_action: action
+  }
+end
+
+def parse_login(value)
+  value.to_s.downcase.strip
+end
+
+def read_state
+  return {} unless File.exist?(STATE_PATH)
+
+  JSON.parse(File.read(STATE_PATH))
+rescue StandardError
+  {}
+end
+
+def safe_write(path, payload)
+  FileUtils.mkdir_p(File.dirname(path))
+  File.write(path, JSON.pretty_generate(payload) + "\n")
+end
+
+def compute_window(state)
+  started_at = Time.now.utc
+  last_successful = parse_time(state["last_successful_run_at"])
+  start_time = last_successful ? last_successful - OVERLAP_SECONDS : started_at - (FIRST_RUN_DAYS * 24 * 60 * 60)
+  [start_time, started_at]
+end
+
+def parse_yaml_values(value)
+  return [] unless value
+
+  if value.is_a?(Array)
+    value.flat_map { |v| parse_yaml_values(v) }
+  elsif value.is_a?(Hash)
+    value.values.flat_map { |v| parse_yaml_values(v) }
+  else
+    [value.to_s]
+  end
+end
+
+def normalize_reported_records(state, now)
+  cutoff = now - (REPORT_RETENTION_DAYS * 24 * 60 * 60)
+  seen = parse_time(state["last_successful_run_at"]) || cutoff
+  raw = Array(state["last_reported_activity_ids"])
+
+  records = {}
+  raw.each do |entry|
+    if entry.is_a?(Hash)
+      id = entry["id"].to_s
+      seen_at = parse_time(entry["seen_at"]) || seen
+    else
+      id = entry.to_s
+      seen_at = seen
+    end
+    next if id.empty? || seen_at < cutoff
+    records[id] = seen_at
+  end
+
+  records
+end
+
+def fetch_team_members
+  members = []
+  query = <<~GRAPHQL
+    query($org:String!,$team:String!,$after:String){
+      organization(login:$org){
+        team(slug:$team){
+          members(first:100, after:$after){
+            nodes{login}
+            pageInfo{hasNextPage endCursor}
+          }
+        }
+      }
+    }
+  GRAPHQL
+
+  cursor = nil
+  loop do
+    data = graphql_query(query, { "org" => ORG, "team" => TEAM, "after" => cursor }.compact)
+    nodes = data.dig("data", "organization", "team", "members")
+    raise "team membership data missing" unless nodes
+
+    Array(nodes["nodes"]).each { |member| members << parse_login(member["login"]) }
+    break unless nodes.dig("pageInfo", "hasNextPage")
+    cursor = nodes.dig("pageInfo", "endCursor")
+  end
+
+  members.reject(&:empty?).uniq
+rescue StandardError
+  paged_array("/orgs/#{ORG}/teams/#{TEAM}/members").map { |member| parse_login(member["login"]) }
+end
+
+def fetch_trusted_actors
+  text = with_retries { fetch_trusted_actors_graphql }
+  text = with_retries { fetch_trusted_actors_rest } if text.to_s.strip.empty?
+  text = with_retries { fetch_trusted_actors_raw } if text.to_s.strip.empty?
+  raise "trusted actors file is empty" if text.empty?
+
+  parsed = begin
+    YAML.safe_load(text)
+  rescue StandardError
+    YAML.load(text)
+  end
+  raise "trusted actors file content could not be parsed" unless parsed.is_a?(Hash) || parsed.is_a?(Array)
+
+  users = parsed.is_a?(Hash) ? Array(parsed["trusted_users"]).map { |v| parse_login(v) }.reject(&:empty?) : []
+  bots = parsed.is_a?(Hash) ? Array(parsed["trusted_bots"]).map { |v| parse_login(v) }.reject(&:empty?) : []
+  metadata_bots = parsed.is_a?(Hash) ? Array(parsed["trusted_metadata_bots"]).map { |v| parse_login(v) }.reject(&:empty?) : []
+  teams = parsed.is_a?(Hash) ? Array(parsed["trusted_teams"]).map { |v| parse_login(v) }.reject(&:empty?) : []
+  extras = parsed.is_a?(Hash) ? parse_yaml_values(parsed["trusted_actors"]) : parse_yaml_values(parsed)
+  extras = extras.map { |v| parse_login(v) }.reject(&:empty?)
+
+  all = (users + bots + metadata_bots + teams + extras + parse_yaml_values(parsed)).map { |v| parse_login(v) }.reject(&:empty?).uniq
+
+  {
+    users: users,
+    bots: bots,
+    metadata_bots: metadata_bots,
+    teams: teams,
+    trusted: all,
+    counts: {
+      users: users.length,
+      bots: bots.length,
+      metadata_bots: metadata_bots.length,
+      teams: teams.length,
+      trusted_unique: all.length
+    }
+  }
+end
+
+def fetch_trusted_actors_graphql
+  query = <<~GRAPHQL
+    query {
+      repository(owner: "#{ORG}", name: "#{TRUSTED_REPO}") {
+        object(expression: "#{TRUSTED_EXPR}") {
+          ... on Blob {
+            text
+          }
+        }
+      }
+    }
+  GRAPHQL
+
+  data = graphql_query(query)
+  data.dig("data", "repository", "object", "text").to_s
+rescue StandardError
+  nil
+end
+
+def fetch_trusted_actors_rest
+  payload = gh_json("/repos/#{ORG}/#{TRUSTED_REPO}/contents/#{TRUSTED_FILE_PATH}?ref=main")
+  return nil if !payload.is_a?(Hash) || payload["encoding"].to_s != "base64" || payload["content"].to_s.strip.empty?
+
+  Base64.decode64(payload["content"].to_s.delete(" \n\r\t")).strip
+rescue StandardError
+  nil
+end
+
+def fetch_trusted_actors_raw
+  payload = gh_json("/repos/#{ORG}/#{TRUSTED_REPO}/contents/#{TRUSTED_FILE_PATH}?ref=main")
+  raw_url = payload.is_a?(Hash) ? payload["download_url"].to_s : ""
+  return nil if raw_url.empty?
+
+  uri = URI(raw_url)
+  response = Net::HTTP.get_response(uri)
+  return nil unless response.is_a?(Net::HTTPSuccess)
+
+  response.body.to_s.strip
+rescue StandardError
+  nil
+end
+
+def post_slack(text)
+  webhook = ENV["CODEX_SLACK_WEBHOOK_URL"]
+  webhook = File.read(SLACK_WEBHOOK_PATH).strip if webhook.to_s.empty? && File.exist?(SLACK_WEBHOOK_PATH)
+  raise "Slack webhook missing" if webhook.to_s.empty?
+
+  uri = URI(webhook)
+  response = Net::HTTP.post(uri, JSON.generate({ text: text }), { "Content-Type" => "application/json" })
+  raise "Slack returned HTTP #{response.code}" unless response.is_a?(Net::HTTPSuccess)
+
+  true
+end
+
+def build_blocked_message(blockers, start_time, end_time)
+  lines = [
+    "**Outside GitHub activity monitor blocked**",
+    "Window: #{format_hst(start_time)} to #{format_hst(end_time)}",
+    "",
+    "*Blocking sources:*"
+  ]
+  blockers.each { |source| lines << "- #{source}" }
+  lines << ""
+  lines << "*Next step:* Fix GitHub access/scopes or the network path, then rerun the monitor."
+  lines.join("\n")
+end
+
+def build_activity_message(items, start_time, end_time)
+  sentence = lambda do |text|
+    text = text.to_s.strip
+    text.match?(/[.!?]\z/) ? text : "#{text}."
+  end
+
+  lines = [
+    "**Outside GitHub activity detected**",
+    "Window: #{format_hst(start_time)} to #{format_hst(end_time)}",
+    "*Items:* #{items.length}",
+    ""
+  ]
+
+  items.each_with_index do |item, index|
+    title = item[:summary].to_s.strip
+    title = "#{title[0, 87].rstrip}..." if title.length > 90
+
+    lines << "- #{item[:repository]} · #{item[:activity_type]} · [#{title}](#{item[:link]}) — author: #{item[:author]}"
+    lines << "  Outside because: #{sentence.call(item[:outside_because])}"
+    lines << "  Suggested action: #{sentence.call(item[:suggested_next_action])}"
+    lines << "" unless index == items.length - 1
+  end
+  lines.join("\n")
+end
+
+def collect_issues(owner, repo, full_name, start_time, trusted, reported_ids, items)
+  encoded = CGI.escape(repo)
+  issues = paged_array("/repos/#{owner}/#{encoded}/issues?state=all&since=#{CGI.escape(start_time.iso8601)}")
+
+  issues.each do |issue|
+    next if issue["pull_request"]
+
+    next unless (created = parse_time(issue["created_at"])) && created >= start_time
+    next unless outside_actor?(issue["user"], trusted)
+
+    add_item(
+      items,
+      reported_ids,
+      id: "issue:#{issue.fetch("node_id", "#{full_name}:issue:#{issue.fetch("number")}")}",
+      repository: full_name,
+      activity_type: "new issue",
+      actor: issue["user"],
+      link: issue["html_url"],
+      summary: "Issue ##{issue["number"]}: #{issue["title"]}",
+      outside_because: outside_because(issue["user"]),
+      action: "Triage the issue and decide whether to respond, label, or close."
+    )
+  end
+end
+
+def collect_issue_comments(owner, repo, full_name, start_time, trusted, reported_ids, items, issue_cache)
+  encoded = CGI.escape(repo)
+  comments = paged_array("/repos/#{owner}/#{encoded}/issues/comments?since=#{CGI.escape(start_time.iso8601)}")
+
+  comments.each do |comment|
+    next unless (created = parse_time(comment["created_at"])) && created >= start_time
+    next unless outside_actor?(comment["user"], trusted)
+
+    issue_number = comment.fetch("issue_url", "").to_s.split("/").last
+    cache_key = "#{full_name}:#{issue_number}"
+    issue = issue_cache[cache_key]
+    unless issue
+      begin
+        issue = gh_json("/repos/#{owner}/#{encoded}/issues/#{issue_number}")
+      rescue StandardError
+        issue = {}
+      end
+      issue_cache[cache_key] = issue
+    end
+
+    target_type = issue && issue["pull_request"] ? "new pull request issue comment" : "new issue comment"
+    title = issue.to_h["title"] || "Unknown"
+
+    add_item(
+      items,
+      reported_ids,
+      id: "issue_comment:#{comment.fetch("node_id", "#{full_name}:comment:#{comment.fetch("id")}")}",
+      repository: full_name,
+      activity_type: target_type,
+      actor: comment["user"],
+      link: comment["html_url"],
+      summary: "Comment on ##{issue_number}: #{title}",
+      outside_because: outside_because(comment["user"]),
+      action: "Review the comment and reply or route it to the repository maintainer."
+    )
+  end
+end
+
+def collect_pr_reviews(owner, repo, pr_number, title, start_time, trusted, reported_ids, items)
+  encoded = CGI.escape(repo)
+  reviews = paged_array("/repos/#{owner}/#{encoded}/pulls/#{pr_number}/reviews")
+
+  reviews.each do |review|
+    next unless (submitted = parse_time(review["submitted_at"])) && submitted >= start_time
+
+    review_state = review["state"].to_s
+    next unless %w[COMMENTED APPROVED CHANGES_REQUESTED].include?(review_state)
+    next unless outside_actor?(review["user"], trusted)
+
+    activity_type = review_state == "CHANGES_REQUESTED" ? "requested changes" : "new pull request review"
+    add_item(
+      items,
+      reported_ids,
+      id: "pull_review:#{review.fetch("node_id", "#{owner}/#{repo}/review:#{review.fetch("id")}")}",
+      repository: "#{owner}/#{repo}",
+      activity_type: activity_type,
+      actor: review["user"],
+      link: review["html_url"] || "https://github.com/#{owner}/#{repo}/pull/#{pr_number}",
+      summary: "Review #{review_state} on PR ##{pr_number}: #{title}",
+        outside_because: outside_because(review["user"]),
+      action: review_state == "CHANGES_REQUESTED" ? "Assess the requested changes and decide whether to respond or update the PR." : "Read the review and decide whether a maintainer response is needed."
+    )
+  end
+end
+
+def collect_pull_requests(owner, repo, full_name, start_time, trusted, reported_ids, items)
+  encoded = CGI.escape(repo)
+  prs = paged_array(
+    "/repos/#{owner}/#{encoded}/pulls?state=all&sort=created&direction=desc&since=#{CGI.escape(start_time.iso8601)}"
+  )
+  warn "  #{full_name} pull_requests fetched=#{prs.length}" if ENV["MONITOR_DEBUG"]
+
+  prs.each do |pr|
+    created = parse_time(pr["created_at"])
+    break if created && created < start_time
+    next unless created && created >= start_time
+    next unless outside_actor?(pr["user"], trusted)
+
+    pr_number = pr.fetch("number")
+    title = pr["title"]
+
+    add_item(
+      items,
+      reported_ids,
+      id: "pull_request:#{pr.fetch("node_id", "#{full_name}:pr:#{pr_number}")}",
+      repository: full_name,
+      activity_type: "new pull request",
+      actor: pr["user"],
+      link: pr["html_url"],
+      summary: "PR ##{pr_number}: #{title}",
+      outside_because: outside_because(pr["user"]),
+      action: "Review the PR for maintainability and assign an internal owner."
+    )
+
+    collect_pr_reviews(owner, repo, pr_number, title, start_time, trusted, reported_ids, items)
+  end
+end
+
+def collect_pull_review_comments(owner, repo, full_name, start_time, trusted, reported_ids, items)
+  encoded = CGI.escape(repo)
+  comments = paged_array("/repos/#{owner}/#{encoded}/pulls/comments?since=#{CGI.escape(start_time.iso8601)}")
+
+  comments.each do |comment|
+    next unless (created = parse_time(comment["created_at"])) && created >= start_time
+    next unless outside_actor?(comment["user"], trusted)
+
+    add_item(
+      items,
+      reported_ids,
+      id: "pull_review_comment:#{comment.fetch("node_id", "#{full_name}:comment:#{comment.fetch("id")}")}",
+      repository: full_name,
+      activity_type: "new pull request review comment",
+      actor: comment["user"],
+      link: comment["html_url"],
+      summary: "Review comment on #{comment["path"]}",
+      outside_because: outside_because(comment["user"]),
+      action: "Review the code comment and decide whether a maintainer response or patch is needed."
+    )
+  end
+end
+
+def collect_discussion_comments(owner, repo, discussion_number, title, start_time, trusted, reported_ids, items, after = nil)
+  loop do
+    query = <<~GRAPHQL
+      query{
+        repository(owner:"#{gq(owner)}",name:"#{gq(repo)}"){
+          discussion(number:#{discussion_number}){
+            comments(first:100#{", after: \"#{gq(after)}\"" if after}){
+              nodes{id url createdAt author{login __typename}}
+              pageInfo{hasNextPage endCursor}
+            }
+          }
+        }
+      }
+    GRAPHQL
+
+    data = graphql_query(query)
+    comment_connection = data.dig("data", "repository", "discussion", "comments")
+    break unless comment_connection
+
+    Array(comment_connection["nodes"]).each do |comment|
+      next unless (created = parse_time(comment["createdAt"])) && created >= start_time
+      next unless outside_actor?(comment["author"], trusted)
+
+      add_item(
+        items,
+        reported_ids,
+        id: "discussion_comment:#{comment["id"]}",
+        repository: "#{owner}/#{repo}",
+        activity_type: "new GitHub Discussion comment",
+        actor: comment["author"],
+        link: comment["url"],
+        summary: "Discussion comment on ##{discussion_number}: #{title}",
+        outside_because: outside_because(comment["author"]),
+        action: "Review the discussion comment and decide whether a maintainer response is needed."
+      )
+    end
+
+    break unless comment_connection.dig("pageInfo", "hasNextPage")
+    after = comment_connection.dig("pageInfo", "endCursor")
+  end
+end
+
+def collect_discussions(owner, repo, start_time, trusted, reported_ids, items)
+  after = nil
+  loop do
+    query = <<~GRAPHQL
+      query{
+        repository(owner:"#{gq(owner)}",name:"#{gq(repo)}"){
+          hasDiscussionsEnabled
+          discussions(first:50#{", after: \"#{gq(after)}\"" if after}, orderBy:{field:UPDATED_AT,direction:DESC}){
+            nodes{
+              id number title url createdAt updatedAt author{login __typename}
+              comments(first:100){nodes{id url createdAt author{login __typename}} pageInfo{hasNextPage endCursor}}
+            }
+            pageInfo{hasNextPage endCursor}
+          }
+        }
+      }
+    GRAPHQL
+
+    data = graphql_query(query)
+    repository = data.dig("data", "repository")
+    break unless repository
+    break unless repository["hasDiscussionsEnabled"]
+
+    discussions = Array(repository.dig("discussions", "nodes"))
+    discussions.each do |discussion|
+      break if parse_time(discussion["updatedAt"]) && parse_time(discussion["updatedAt"]) < start_time
+
+      actor = discussion["author"]
+
+      if (created = parse_time(discussion["createdAt"])) && created >= start_time && outside_actor?(actor, trusted)
+        add_item(
+          items,
+          reported_ids,
+          id: "discussion:#{discussion["id"]}",
+          repository: "#{owner}/#{repo}",
+          activity_type: "new GitHub Discussion",
+          actor: actor,
+          link: discussion["url"],
+          summary: "Discussion ##{discussion["number"]}: #{discussion["title"]}",
+          outside_because: outside_because(actor),
+          action: "Review the discussion and decide whether to answer or convert to an issue."
+        )
+      end
+
+      if discussion.dig("comments", "pageInfo", "hasNextPage")
+        collect_discussion_comments(
+          owner,
+          repo,
+          discussion["number"],
+          discussion["title"],
+          start_time,
+          trusted,
+          reported_ids,
+          items,
+          discussion.dig("comments", "pageInfo", "endCursor")
+        )
+      end
+
+      Array(discussion.dig("comments", "nodes")).each do |comment|
+        next unless (created = parse_time(comment["createdAt"])) && created >= start_time
+        next unless outside_actor?(comment["author"], trusted)
+
+        add_item(
+          items,
+          reported_ids,
+          id: "discussion_comment:#{comment["id"]}",
+          repository: "#{owner}/#{repo}",
+          activity_type: "new GitHub Discussion comment",
+          actor: comment["author"],
+          link: comment["url"],
+          summary: "Discussion comment on ##{discussion["number"]}: #{discussion["title"]}",
+          outside_because: outside_because(comment["author"]),
+          action: "Review the discussion comment and decide whether a maintainer response is needed."
+        )
+      end
+    end
+
+    break unless repository.dig("discussions", "pageInfo", "hasNextPage")
+    after = repository.dig("discussions", "pageInfo", "endCursor")
+  end
+end
+
+state = read_state
+state_read = File.exist?(STATE_PATH)
+start_time, ended_at = compute_window(state)
+reported_records = normalize_reported_records(state, ended_at)
+reported_ids = reported_records.keys.to_set
+
+blockers = []
+team_members = []
+trusted_payload = {
+  users: [],
+  bots: [],
+  metadata_bots: [],
+  teams: [],
+  counts: { users: 0, bots: 0, metadata_bots: 0, teams: 0, trusted_unique: 0 },
+  trusted: []
+}
+trusted = Set.new
+
+begin
+  team_members = fetch_team_members
+  trusted_payload = fetch_trusted_actors
+  trusted = (team_members + trusted_payload.fetch(:trusted, [])).uniq.to_set
+rescue StandardError => e
+  blockers << "allowlist refresh failed: #{e.message}"
+end
+
+repos = []
+items = []
+issue_cache = {}
+state_updated = false
+slack_error = nil
+slack_sent = false
+
+if blockers.empty?
+  begin
+    repos = paged_array("/orgs/#{ORG}/repos?type=public").select do |repo|
+      !repo["private"] && !repo["archived"] && !repo["disabled"]
+    end
+
+    if (repo_filter = ENV["MONITOR_REPO"]).to_s.strip != ""
+      repos = repos.select { |repo| repo.fetch("full_name", "") == repo_filter }
+    end
+
+    repos.each_with_index do |repo, index|
+      name = repo.fetch("name")
+      full_name = repo.fetch("full_name")
+      warn "scanning #{index + 1}/#{repos.length} #{full_name}"
+
+      collect_issues(ORG, name, full_name, start_time, trusted, reported_ids, items)
+      collect_issue_comments(ORG, name, full_name, start_time, trusted, reported_ids, items, issue_cache)
+      collect_pull_requests(ORG, name, full_name, start_time, trusted, reported_ids, items)
+      collect_pull_review_comments(ORG, name, full_name, start_time, trusted, reported_ids, items)
+      collect_discussions(ORG, name, start_time, trusted, reported_ids, items)
+    end
+  rescue StandardError => e
+    blockers << "scan failed: #{e.message}"
+  end
+end
+
+items.sort_by! { |item| [item[:repository], item[:activity_type], item[:author], item[:summary]] }
+
+if blockers.empty? && items.any?
+  begin
+    post_slack(build_activity_message(items, start_time, ended_at))
+    slack_sent = true
+  rescue StandardError => e
+    slack_error = e.message
+  end
+end
+
+if blockers.empty? && (items.empty? || slack_sent)
+  cutoff = ended_at - (REPORT_RETENTION_DAYS * 24 * 60 * 60)
+  updated_records = reported_records.dup
+  items.each { |item| updated_records[item[:id]] = ended_at }
+  updated_records = updated_records.select { |_, seen_at| seen_at >= cutoff }
+
+  state_payload = {
+    last_successful_run_at: ended_at.iso8601,
+    repository_count: repos.length,
+    team_count: team_members.length,
+    trusted_users: trusted_payload.fetch(:counts, {})["users"] || trusted_payload.fetch(:counts, {})[:users],
+    trusted_bots: trusted_payload.fetch(:counts, {})["bots"] || trusted_payload.fetch(:counts, {})[:bots],
+    trusted_metadata_bots: trusted_payload.fetch(:counts, {})["metadata_bots"] || trusted_payload.fetch(:counts, {})[:metadata_bots],
+    trusted_teams: trusted_payload.fetch(:counts, {})["teams"] || trusted_payload.fetch(:counts, {})[:teams],
+    trusted_unique: trusted.length,
+    allowlist_refresh_status: "ok",
+    run_status: items.empty? ? "no_outside_activity" : "outside_activity_reported",
+    last_reported_activity_ids: updated_records.map { |id, seen_at| { id: id, seen_at: seen_at.iso8601 } }
+  }
+  safe_write(STATE_PATH, state_payload)
+  state_updated = true
+end
+
+result = {
+  scan_window: {
+    start_utc: start_time.iso8601,
+    end_utc: ended_at.iso8601,
+    start_hst: format_hst(start_time),
+    end_hst: format_hst(ended_at)
+  },
+  repository_count: repos.length,
+  allowlists: {
+    team_members: team_members.length,
+    trusted_users: trusted_payload.fetch(:counts, {})[:users],
+    trusted_bots: trusted_payload.fetch(:counts, {})[:bots],
+    trusted_metadata_bots: trusted_payload.fetch(:counts, {})[:metadata_bots],
+    trusted_teams: trusted_payload.fetch(:counts, {})[:teams],
+    trusted_unique: trusted.length,
+    refresh_status: blockers.empty? ? "ok" : "blocked"
+  },
+  outside_activity_count: items.length,
+  state_read: state_read,
+  state_updated: state_updated,
+  slack_sent: slack_sent,
+  slack_error: slack_error,
+  blockers: blockers,
+  items: items
+}
+
+if blockers.any?
+  blockers << "scan status: state not advanced" unless state_updated
+  begin
+    post_slack(build_blocked_message(blockers, start_time, ended_at))
+    result[:slack_sent] = true
+  rescue StandardError => e
+    result[:slack_error] = e.message unless slack_error
+    slack_error ||= e.message
+  end
+end
+
+status_label = if blockers.empty? && items.empty?
+  "OUTSIDE ACTIVITY: ZERO"
+else
+  "OUTSIDE ACTIVITY: ATTENTION"
+end
+scan_completed = blockers.empty? && (!items.any? || slack_sent)
+result[:result_status] = scan_completed ? "completed" : "attention_needed"
+result[:result_summary] = if blockers.empty? && items.empty?
+  "No new outside activity found in scan window."
+elsif blockers.empty?
+  "Outside activity detected: #{items.length} item(s) found."
+else
+  "Scan blocked or incomplete: review blockers and rerun."
+end
+result[:result_status_label] = status_label
+
+safe_write(RESULT_PATH, result)
+puts status_label
+puts result[:result_summary]
+puts JSON.pretty_generate(result)
+puts status_label
+
+if blockers.any? || (items.any? && !slack_sent)
+  exit 2
+else
+  exit 0
+end

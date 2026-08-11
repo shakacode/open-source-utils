@@ -675,6 +675,7 @@ end
 
 repos = []
 discovered_repos = []
+minimum_scan_requests = 0
 items = []
 issue_cache = {}
 state_updated = false
@@ -694,6 +695,9 @@ if blockers.empty?
         OpenSourceUtils::MonitorSupport.active_repository?(repo, activity_cutoff)
       end
     end
+
+    minimum_scan_requests = OpenSourceUtils::MonitorSupport.minimum_scan_requests(repos)
+    REQUEST_BUDGET.ensure_capacity!(minimum_scan_requests)
 
     repos.each_with_index do |repo, index|
       name = repo.fetch("name")
@@ -735,6 +739,7 @@ if blockers.empty? && (items.empty? || slack_sent)
     repository_activity_cutoff: activity_cutoff.iso8601,
     api_requests_used: REQUEST_BUDGET.used,
     api_request_budget: REQUEST_BUDGET.limit,
+    minimum_scan_requests: minimum_scan_requests,
     team_count: team_members.length,
     trusted_users: trusted_payload.fetch(:counts, {})["users"] || trusted_payload.fetch(:counts, {})[:users],
     trusted_bots: trusted_payload.fetch(:counts, {})["bots"] || trusted_payload.fetch(:counts, {})[:bots],
@@ -762,7 +767,8 @@ result = {
   discussions_repository_count: repos.count { |repo| repo["has_discussions"] },
   api_requests: {
     used: REQUEST_BUDGET.used,
-    budget: REQUEST_BUDGET.limit
+    budget: REQUEST_BUDGET.limit,
+    minimum_scan_requests: minimum_scan_requests
   },
   allowlists: {
     team_members: team_members.length,

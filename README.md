@@ -48,6 +48,8 @@ The runner applies several layers of protection before scanning:
 - request pull requests newest-first and stop pagination at the scan-window
   cutoff
 - stop immediately on GitHub rate-limit responses instead of retrying them
+- estimate the minimum scan cost after discovery and abort before scanning if
+  the eligible set cannot fit inside the remaining budget
 - fail closed before exceeding a hard 400-request budget per run
 - record the discovered and eligible repository counts, activity cutoff, and
   request usage in every result

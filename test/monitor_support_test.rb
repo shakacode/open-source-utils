@@ -54,6 +54,25 @@ class MonitorSupportTest < Minitest::Test
     assert_match "2-request budget", error.message
   end
 
+  def test_request_budget_rejects_an_unaffordable_scan_before_consuming_it
+    budget = OpenSourceUtils::RequestBudget.new(3)
+    budget.consume!
+
+    error = assert_raises(OpenSourceUtils::RequestBudgetExceeded) { budget.ensure_capacity!(3) }
+
+    assert_equal 1, budget.used
+    assert_match "requires 3 more requests", error.message
+  end
+
+  def test_minimum_scan_requests_skips_discussion_cost_when_disabled
+    repositories = [
+      { "has_discussions" => false },
+      { "has_discussions" => true }
+    ]
+
+    assert_equal 9, OpenSourceUtils::MonitorSupport.minimum_scan_requests(repositories)
+  end
+
   def test_rate_limit_errors_are_not_retryable
     assert OpenSourceUtils::MonitorSupport.rate_limit_error?("API rate limit exceeded for user ID 1118459")
     assert OpenSourceUtils::MonitorSupport.rate_limit_error?("HTTP 429 Too Many Requests")

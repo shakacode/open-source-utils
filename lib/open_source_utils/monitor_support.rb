@@ -19,6 +19,14 @@ module OpenSourceUtils
 
       @used += 1
     end
+
+    def ensure_capacity!(additional_requests)
+      additional_requests = Integer(additional_requests)
+      return if @used + additional_requests <= @limit
+
+      raise RequestBudgetExceeded,
+        "GitHub API scan requires #{additional_requests} more requests with #{@limit - @used} remaining in the #{@limit}-request budget"
+    end
   end
 
   module MonitorSupport
@@ -34,6 +42,10 @@ module OpenSourceUtils
 
     def rate_limit_error?(message)
       message.to_s.match?(/(?:API rate limit exceeded|HTTP 429|secondary rate limit)/i)
+    end
+
+    def minimum_scan_requests(repositories)
+      repositories.sum { |repository| 4 + (repository["has_discussions"] ? 1 : 0) }
     end
 
     def paged_array(path, fetcher:, stop_when: nil)

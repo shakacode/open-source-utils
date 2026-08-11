@@ -36,20 +36,50 @@ The workspace receives:
 - `.Codex/oss-outside-activity-monitor-state.json`
 - `.Codex/oss-outside-activity-monitor-result.json`
 
-### GitHub API usage
+### GitHub API safeguards
 
-The imported runner preserves the existing behavior so it can be moved under
-version control without changing production semantics. It currently polls each
-public, non-archived ShakaCode repository and is not considered rate-limit
-optimized.
+The runner applies several layers of protection before scanning:
 
-Known follow-up work:
+- discover repositories once, then reuse those response fields to keep only
+  repositories whose latest `created_at`, `updated_at`, or `pushed_at` value is
+  within the last 365 days
+- skip the Discussions GraphQL query unless the repository advertises that
+  Discussions are enabled
+- request pull requests newest-first and stop pagination at the scan-window
+  cutoff
+- stop immediately on GitHub rate-limit responses instead of retrying them
+- fail closed before exceeding a hard 400-request budget per run
+- record the discovered and eligible repository counts, activity cutoff, and
+  request usage in every result
 
-- replace organization-wide polling with GitHub App webhooks
-- stop pull-request pagination as soon as the requested time window is passed
-- persist ETags and use authenticated conditional requests
-- honor GitHub rate-limit reset headers instead of retrying quota failures
-- cache repository and allowlist metadata when safe
+The defaults can be tightened for diagnostics:
 
-Until that work is complete, the Codex automation should run no more than
-weekly.
+| Environment variable | Default | Purpose |
+| --- | ---: | --- |
+| `MONITOR_ACTIVE_REPO_DAYS` | `365` | Maximum repository inactivity before it is skipped |
+| `MONITOR_MAX_API_REQUESTS` | `400` | Hard request ceiling for the run |
+| `MONITOR_REPO` | unset | Force one exact repository for a bounded diagnostic run |
+
+The current ShakaCode catalog has 197 public, non-archived repositories. The
+12-month activity filter selects about 91, and only 5 of those currently have
+Discussions enabled. A routine run is expected to use roughly 375 requests,
+with the 400-request ceiling preventing unexpected pagination or retries from
+consuming more quota.
+
+GitHub App webhooks remain the best long-term design because they eliminate
+organization-wide polling. Authenticated ETag-based conditional requests are
+the next useful polling optimization if this runner remains in service.
+
+## Development
+
+Run the unit tests:
+
+```sh
+.agents/bin/test
+```
+
+Run the complete local validation:
+
+```sh
+.agents/bin/validate
+```

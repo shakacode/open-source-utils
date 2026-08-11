@@ -12,6 +12,8 @@ require "time"
 require "uri"
 require "yaml"
 
+require_relative "../lib/open_source_utils/monitor_support"
+
 ROOT = File.expand_path(ENV.fetch("OSS_MONITOR_WORKSPACE", File.expand_path("..", __dir__)))
 STATE_PATH = File.join(ROOT, ".Codex", "oss-outside-activity-monitor-state.json")
 RESULT_PATH = File.join(ROOT, ".Codex", "oss-outside-activity-monitor-result.json")
@@ -28,7 +30,10 @@ RETRY_DELAYS = [1, 2, 4]
 FIRST_RUN_DAYS = 60
 OVERLAP_SECONDS = 5 * 60
 REPORT_RETENTION_DAYS = 120
+ACTIVE_REPO_DAYS = Integer(ENV.fetch("MONITOR_ACTIVE_REPO_DAYS", "365"))
+MAX_GITHUB_API_REQUESTS = Integer(ENV.fetch("MONITOR_MAX_API_REQUESTS", "400"))
 HST_OFFSET = "-10:00"
+REQUEST_BUDGET = OpenSourceUtils::RequestBudget.new(MAX_GITHUB_API_REQUESTS)
 KNOWN_BOT_LOGIN_PREFIXES = [
   "github-actions",
   "dependabot",
@@ -52,9 +57,11 @@ def with_retries
   attempts = 0
   begin
     yield
+  rescue OpenSourceUtils::RequestBudgetExceeded
+    raise
   rescue StandardError => e
     attempts += 1
-    raise e if attempts >= MAX_RETRIES
+    raise e if attempts >= MAX_RETRIES || OpenSourceUtils::MonitorSupport.rate_limit_error?(e.message)
 
     sleep(RETRY_DELAYS[[attempts - 1, RETRY_DELAYS.length - 1].min])
     retry
@@ -63,6 +70,7 @@ end
 
 def gh_json(*args)
   with_retries do
+    REQUEST_BUDGET.consume!
     stdout, stderr, status = Open3.capture3(TIMEOUT, GH_TIMEOUT_SECONDS, "gh", "api", *args)
     unless status.success?
       error_message = stderr.to_s.strip
@@ -74,23 +82,8 @@ def gh_json(*args)
   end
 end
 
-def paged_array(path)
-  page = 1
-  items = []
-
-  loop do
-    sep = path.include?("?") ? "&" : "?"
-    batch = gh_json("#{path}#{sep}per_page=100&page=#{page}")
-    raise "Expected array from #{path}" unless batch.is_a?(Array)
-
-    break if batch.empty?
-
-    items.concat(batch)
-    break if batch.length < 100
-    page += 1
-  end
-
-  items
+def paged_array(path, stop_when: nil)
+  OpenSourceUtils::MonitorSupport.paged_array(path, fetcher: method(:gh_json), stop_when: stop_when)
 end
 
 def graphql_query(query, variables = {})
@@ -475,13 +468,13 @@ end
 def collect_pull_requests(owner, repo, full_name, start_time, trusted, reported_ids, items)
   encoded = CGI.escape(repo)
   prs = paged_array(
-    "/repos/#{owner}/#{encoded}/pulls?state=all&sort=created&direction=desc&since=#{CGI.escape(start_time.iso8601)}"
+    "/repos/#{owner}/#{encoded}/pulls?state=all&sort=created&direction=desc",
+    stop_when: ->(pr) { (created = parse_time(pr["created_at"])) && created < start_time }
   )
   warn "  #{full_name} pull_requests fetched=#{prs.length}" if ENV["MONITOR_DEBUG"]
 
   prs.each do |pr|
     created = parse_time(pr["created_at"])
-    break if created && created < start_time
     next unless created && created >= start_time
     next unless outside_actor?(pr["user"], trusted)
 
@@ -652,9 +645,11 @@ def collect_discussions(owner, repo, start_time, trusted, reported_ids, items)
   end
 end
 
+def run
 state = read_state
 state_read = File.exist?(STATE_PATH)
 start_time, ended_at = compute_window(state)
+activity_cutoff = ended_at - (ACTIVE_REPO_DAYS * 24 * 60 * 60)
 reported_records = normalize_reported_records(state, ended_at)
 reported_ids = reported_records.keys.to_set
 
@@ -679,6 +674,7 @@ rescue StandardError => e
 end
 
 repos = []
+discovered_repos = []
 items = []
 issue_cache = {}
 state_updated = false
@@ -687,12 +683,16 @@ slack_sent = false
 
 if blockers.empty?
   begin
-    repos = paged_array("/orgs/#{ORG}/repos?type=public").select do |repo|
+    discovered_repos = paged_array("/orgs/#{ORG}/repos?type=public").select do |repo|
       !repo["private"] && !repo["archived"] && !repo["disabled"]
     end
 
     if (repo_filter = ENV["MONITOR_REPO"]).to_s.strip != ""
-      repos = repos.select { |repo| repo.fetch("full_name", "") == repo_filter }
+      repos = discovered_repos.select { |repo| repo.fetch("full_name", "") == repo_filter }
+    else
+      repos = discovered_repos.select do |repo|
+        OpenSourceUtils::MonitorSupport.active_repository?(repo, activity_cutoff)
+      end
     end
 
     repos.each_with_index do |repo, index|
@@ -704,7 +704,7 @@ if blockers.empty?
       collect_issue_comments(ORG, name, full_name, start_time, trusted, reported_ids, items, issue_cache)
       collect_pull_requests(ORG, name, full_name, start_time, trusted, reported_ids, items)
       collect_pull_review_comments(ORG, name, full_name, start_time, trusted, reported_ids, items)
-      collect_discussions(ORG, name, start_time, trusted, reported_ids, items)
+      collect_discussions(ORG, name, start_time, trusted, reported_ids, items) if repo["has_discussions"]
     end
   rescue StandardError => e
     blockers << "scan failed: #{e.message}"
@@ -731,6 +731,10 @@ if blockers.empty? && (items.empty? || slack_sent)
   state_payload = {
     last_successful_run_at: ended_at.iso8601,
     repository_count: repos.length,
+    discovered_repository_count: discovered_repos.length,
+    repository_activity_cutoff: activity_cutoff.iso8601,
+    api_requests_used: REQUEST_BUDGET.used,
+    api_request_budget: REQUEST_BUDGET.limit,
     team_count: team_members.length,
     trusted_users: trusted_payload.fetch(:counts, {})["users"] || trusted_payload.fetch(:counts, {})[:users],
     trusted_bots: trusted_payload.fetch(:counts, {})["bots"] || trusted_payload.fetch(:counts, {})[:bots],
@@ -753,6 +757,13 @@ result = {
     end_hst: format_hst(ended_at)
   },
   repository_count: repos.length,
+  discovered_repository_count: discovered_repos.length,
+  repository_activity_cutoff: activity_cutoff.iso8601,
+  discussions_repository_count: repos.count { |repo| repo["has_discussions"] },
+  api_requests: {
+    used: REQUEST_BUDGET.used,
+    budget: REQUEST_BUDGET.limit
+  },
   allowlists: {
     team_members: team_members.length,
     trusted_users: trusted_payload.fetch(:counts, {})[:users],
@@ -809,3 +820,6 @@ if blockers.any? || (items.any? && !slack_sent)
 else
   exit 0
 end
+end
+
+run if $PROGRAM_NAME == __FILE__

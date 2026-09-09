@@ -50,7 +50,7 @@ The runner applies several layers of protection before scanning:
 - stop immediately on GitHub rate-limit responses instead of retrying them
 - estimate the minimum scan cost after discovery and abort before scanning if
   the eligible set cannot fit inside the remaining budget
-- fail closed before exceeding a hard 400-request budget per run
+- fail closed before exceeding a hard 600-request budget per run
 - record the discovered and eligible repository counts, activity cutoff, and
   request usage in every result
 
@@ -59,14 +59,14 @@ The defaults can be tightened for diagnostics:
 | Environment variable | Default | Purpose |
 | --- | ---: | --- |
 | `MONITOR_ACTIVE_REPO_DAYS` | `365` | Maximum repository inactivity before it is skipped |
-| `MONITOR_MAX_API_REQUESTS` | `400` | Hard request ceiling for the run |
+| `MONITOR_MAX_API_REQUESTS` | `600` | Hard request ceiling for the run |
 | `MONITOR_REPO` | unset | Force one exact repository for a bounded diagnostic run |
 
-The current ShakaCode catalog has 197 public, non-archived repositories. The
-12-month activity filter selects about 91, and only 5 of those currently have
-Discussions enabled. A routine run is expected to use roughly 375 requests,
-with the 400-request ceiling preventing unexpected pagination or retries from
-consuming more quota.
+The current ShakaCode catalog has about 200 public, non-archived repositories.
+The 12-month activity filter selects about 100, and only a handful currently
+have Discussions enabled. A routine run requires just over 400 requests before
+pagination; the 600-request ceiling leaves bounded headroom for pagination and
+retries without allowing an unexpectedly large scan.
 
 GitHub App webhooks remain the best long-term design because they eliminate
 organization-wide polling. Authenticated ETag-based conditional requests are

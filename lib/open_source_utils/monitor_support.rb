@@ -41,7 +41,7 @@ module OpenSourceUtils
     end
 
     def rate_limit_error?(message)
-      message.to_s.match?(/(?:API rate limit exceeded|HTTP 429|secondary rate limit)/i)
+      message.to_s.match?(/(?:API rate limit (?:already )?exceeded|RATE_LIMITED|HTTP 429|secondary rate limit)/i)
     end
 
     def minimum_scan_requests(repositories)

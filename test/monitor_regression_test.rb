@@ -28,16 +28,23 @@ class MonitorRegressionTest < Minitest::Test
     assert_includes queries.last, 'after: "next"'
   end
 
-  def test_large_review_connection_uses_complete_paginated_rest_fallback
-    data = pr(1, "APPROVED")
-    data["reviews"]["pageInfo"]["hasPreviousPage"] = true
-    @runner.define_singleton_method(:graphql_query) do |_query|
-      { "data" => { "repository" => { "pullRequests" => { "nodes" => [data], "pageInfo" => {} } } } }
+  def test_large_review_connection_is_paginated_in_batches
+    first = pr(1, "APPROVED")
+    first["reviews"]["pageInfo"] = { "hasNextPage" => true, "endCursor" => "more" }
+    next_reviews = pr(2, "CHANGES_REQUESTED")["reviews"]
+    queries = []
+    @runner.define_singleton_method(:graphql_query) do |query|
+      queries << query
+      if queries.length == 1
+        { "data" => { "repository" => { "pullRequests" => { "nodes" => [first], "pageInfo" => {} } } } }
+      else
+        { "data" => { "pr0" => { "reviews" => next_reviews } } }
+      end
     end
-    requests = []
-    @runner.define_singleton_method(:paged_array) { |path| requests << path; [] }
-    @runner.send(:collect_pull_requests, "shakacode", "example", "shakacode/example", @cutoff, Set.new, Set.new, [])
-    assert_equal ["/repos/shakacode/example/pulls/1/reviews"], requests
+    items = []
+    @runner.send(:collect_pull_requests, "shakacode", "example", "shakacode/example", @cutoff, Set.new, Set.new, items)
+    assert_equal 2, items.length
+    assert_includes queries.last, 'after:"more"'
   end
 
   def test_fallbacks_propagate_rate_limit_and_budget_errors
@@ -161,5 +168,39 @@ class MonitorRegressionTest
     assert @runner.send(:outside_actor?, { "login" => "claude", "type" => "User" }, trusted)
     assert @runner.send(:outside_actor?, { "login" => "shakacode", "type" => "User" }, trusted)
     refute @runner.send(:outside_actor?, { "login" => "claude", "type" => "Bot" }, trusted)
+  end
+end
+
+class MonitorRegressionTest
+  def test_successful_dry_run_with_activity_does_not_send_or_advance_state
+    writes = []
+    sends = []
+    @runner.define_singleton_method(:read_state) { { "last_successful_run_at" => "2026-10-31T00:00:00Z" } }
+    @runner.define_singleton_method(:fetch_team_members) { |*_args| [] }
+    @runner.define_singleton_method(:fetch_trusted_actors) { { trusted: [], counts: {} } }
+    @runner.define_singleton_method(:paged_array) do |*_args|
+      [{ "name" => "example", "full_name" => "shakacode/example", "pushed_at" => Time.now.utc.iso8601 }]
+    end
+    @runner.define_singleton_method(:collect_issues) do |*_args|
+      _args.last << { repository: "shakacode/example", activity_type: "new issue", author: "outside", summary: "issue" }
+    end
+    %i[collect_issue_comments collect_pull_requests collect_pull_review_comments].each do |method|
+      @runner.define_singleton_method(method) { |*_args| nil }
+    end
+    @runner.define_singleton_method(:safe_write) { |path, data| writes << [path, data] }
+    @runner.define_singleton_method(:post_slack) { |text| sends << text; true }
+    previous = ENV["MONITOR_DRY_RUN"]
+    begin
+      ENV["MONITOR_DRY_RUN"] = "1"
+      error = assert_raises(SystemExit) { capture_io { @runner.send(:run) } }
+      assert_equal 0, error.status
+      assert_empty sends
+      assert_equal [RESULT_PATH], writes.map(&:first)
+      refute writes.last.last[:state_updated]
+      assert_equal 1, writes.last.last[:outside_activity_count]
+      assert_equal "completed", writes.last.last[:result_status]
+    ensure
+      ENV["MONITOR_DRY_RUN"] = previous
+    end
   end
 end

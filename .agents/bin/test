@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+set -eu
+
+for test_file in test/*_test.rb; do
+  ruby -Itest "$test_file"
+done

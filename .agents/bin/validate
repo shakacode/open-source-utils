@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+set -eu
+
+ruby -c bin/monitor_outside_activity
+ruby -c lib/open_source_utils/monitor_support.rb
+.agents/bin/test
+git diff --check

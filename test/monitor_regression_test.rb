@@ -1,0 +1,332 @@
+# frozen_string_literal: true
+
+require "minitest/autorun"
+require "tmpdir"
+load File.expand_path("../bin/monitor_outside_activity", __dir__)
+
+class MonitorRegressionTest < Minitest::Test
+  def setup
+    @runner = Object.new
+    @cutoff = Time.utc(2026, 11, 1)
+  end
+
+  def test_old_internal_pr_and_later_pages_still_collect_new_outside_reviews
+    queries = []
+    pages = [
+      { "nodes" => [pr(1, "APPROVED")], "pageInfo" => { "hasNextPage" => true, "endCursor" => "next" } },
+      { "nodes" => [pr(2, "CHANGES_REQUESTED")], "pageInfo" => { "hasNextPage" => false } }
+    ]
+    @runner.define_singleton_method(:graphql_query) do |query|
+      queries << query
+      { "data" => { "repository" => { "pullRequests" => pages.shift } } }
+    end
+    items = []
+    @runner.send(:collect_pull_requests, "shakacode", "example", "shakacode/example", @cutoff, Set["maintainer"], Set.new, items)
+    assert_equal ["new pull request review", "requested changes"], items.map { |item| item[:activity_type] }
+    assert_equal %w[outside outside], items.map { |item| item[:author] }
+    assert_equal ["pull_review:review1", "pull_review:review2"], items.map { |item| item[:id] }
+    assert_includes queries.last, 'after: "next"'
+  end
+
+  def test_large_review_connection_is_paginated_in_batches
+    first = pr(1, "APPROVED")
+    first["reviews"]["pageInfo"] = { "hasNextPage" => true, "endCursor" => "more" }
+    next_reviews = pr(2, "CHANGES_REQUESTED")["reviews"]
+    queries = []
+    @runner.define_singleton_method(:graphql_query) do |query|
+      queries << query
+      if queries.length == 1
+        { "data" => { "repository" => { "pullRequests" => { "nodes" => [first], "pageInfo" => {} } } } }
+      else
+        { "data" => { "pr0" => { "reviews" => next_reviews } } }
+      end
+    end
+    items = []
+    @runner.send(:collect_pull_requests, "shakacode", "example", "shakacode/example", @cutoff, Set.new, Set.new, items)
+    assert_equal 2, items.length
+    assert_includes queries.last, 'after:"more"'
+  end
+
+  def test_fallbacks_propagate_rate_limit_and_budget_errors
+    [RuntimeError.new("HTTP 429"), OpenSourceUtils::RequestBudgetExceeded.new("exhausted")].each do |error|
+      calls = 0
+      @runner.define_singleton_method(:gh_json) { |*_args| calls += 1; raise error }
+      @runner.define_singleton_method(:graphql_query) { |*_args| calls += 1; raise error }
+      %i[fetch_team_members fetch_trusted_actors_graphql fetch_trusted_actors_rest fetch_trusted_actors_raw].each do |method|
+        assert_same error, assert_raises(error.class) { @runner.send(method) }
+      end
+      assert_equal 4, calls
+    end
+  end
+
+  def test_unrelated_metadata_does_not_grant_trust
+    @runner.define_singleton_method(:fetch_trusted_actors_graphql) { "trusted_users: [Maintainer]\nnotes: outsider\n" }
+    assert_equal ["maintainer"], @runner.send(:fetch_trusted_actors)[:trusted]
+  end
+
+  def test_yaml_objects_are_rejected
+    @runner.define_singleton_method(:fetch_trusted_actors_graphql) { "--- !ruby/object:Object {}" }
+    assert_raises(Psych::DisallowedClass) { @runner.send(:fetch_trusted_actors) }
+  end
+
+  def test_deleted_actor_and_graphql_escaping
+    refute @runner.send(:outside_actor?, nil, Set.new)
+    value = "a\\b\"c\n"
+    assert_equal value, JSON.parse('"' + @runner.send(:gq, value) + '"')
+  end
+
+  def test_old_discussion_update_does_not_hide_recent_comment_on_later_page
+    calls = 0
+    cutoff = @cutoff
+    @runner.define_singleton_method(:graphql_query) do |_query|
+      calls += 1
+      comment = { "id" => "reply", "createdAt" => cutoff.iso8601, "url" => "https://github.com/discussion#reply", "author" => { "login" => "outside", "__typename" => "User" } }
+      { "data" => { "repository" => { "hasDiscussionsEnabled" => true, "discussions" => {
+        "nodes" => [{ "updatedAt" => "2020-01-01T00:00:00Z", "comments" => { "nodes" => calls == 2 ? [comment] : [] } }],
+        "pageInfo" => { "hasNextPage" => calls == 1, "endCursor" => "next" }
+      } } } }
+    end
+    items = []
+    @runner.send(:collect_discussions, "shakacode", "example", @cutoff, Set.new, Set.new, items)
+    assert_equal 2, calls
+    assert_equal ["discussion_comment:reply"], items.map { |item| item[:id] }
+  end
+
+  def test_filtered_run_does_not_advance_shared_watermark_or_send_slack
+    Dir.mktmpdir do |dir|
+      state = { "last_successful_run_at" => "2026-10-01T00:00:00Z" }
+      writes = []
+      @runner.define_singleton_method(:read_state) { state }
+      @runner.define_singleton_method(:fetch_team_members) { [] }
+      @runner.define_singleton_method(:fetch_trusted_actors) { { trusted: [], counts: {} } }
+      @runner.define_singleton_method(:paged_array) { |*_args| [] }
+      @runner.define_singleton_method(:safe_write) { |path, payload| writes << [path, payload] }
+      @runner.define_singleton_method(:post_slack) { |*_args| raise "must not send" }
+      previous = ENV["MONITOR_REPO"]
+      begin
+        ENV["MONITOR_REPO"] = "shakacode/does-not-exist "
+        assert_raises(SystemExit) { capture_io { @runner.send(:run) } }
+        assert_equal [RESULT_PATH], writes.map(&:first)
+        refute writes.last.last[:state_updated]
+        assert_equal "2026-10-01T00:00:00Z", state["last_successful_run_at"]
+      ensure
+        ENV["MONITOR_REPO"] = previous
+      end
+    end
+  end
+
+  def test_slack_webhook_uses_mrkdwn_and_escapes_title
+    item = { summary: "Review <code> | label", repository: "shakacode/example", activity_type: "review", link: "https://github.com/shakacode/example/pull/1", author: "outside" }
+    message = @runner.send(:build_activity_message, [item], @cutoff, @cutoff)
+    assert_includes message, '*Outside GitHub activity detected*'
+    assert_includes message, '<https://github.com/shakacode/example/pull/1|Review &lt;code&gt; ¦ label>'
+  end
+
+  private
+
+  def pr(number, state)
+    { "id" => "pr#{number}", "number" => number, "title" => "Old PR", "createdAt" => "2020-01-01T00:00:00Z",
+      "author" => { "login" => "maintainer", "__typename" => "User" },
+      "reviews" => { "nodes" => [{ "id" => "review#{number}", "state" => state,
+        "submittedAt" => "2026-11-01T00:00:01Z", "url" => "https://github.com/shakacode/example/pull/#{number}#review",
+        "author" => { "login" => "outside", "__typename" => "User" } }], "pageInfo" => { "hasPreviousPage" => false } } }
+  end
+end
+
+
+class MonitorRegressionTest
+  def test_raw_request_consumes_budget
+    @runner.define_singleton_method(:gh_json) { |*_args| { "download_url" => "https://raw.githubusercontent.com/shakacode/example/main/actors.yml" } }
+    response = Net::HTTPOK.new("1.1", "200", "OK")
+    response.instance_variable_set(:@read, true)
+    response.body = "trusted_users: [maintainer]"
+    before = REQUEST_BUDGET.used
+    original = Net::HTTP.method(:get_response)
+    Net::HTTP.define_singleton_method(:get_response) { |_uri| response }
+    begin
+      assert_equal "trusted_users: [maintainer]", @runner.send(:fetch_trusted_actors_raw)
+      assert_equal before + 1, REQUEST_BUDGET.used
+    ensure
+      Net::HTTP.define_singleton_method(:get_response, original)
+    end
+  end
+end
+
+class MonitorRegressionTest
+  def test_replies_on_old_internal_comments_are_collected_and_paginated
+    actor = { "login" => "outside", "__typename" => "User" }
+    reply = { "id" => "reply1", "url" => "https://github.com/discussion#reply1", "createdAt" => @cutoff.iso8601, "author" => actor }
+    comment = { "id" => "root", "createdAt" => "2020-01-01T00:00:00Z", "author" => { "login" => "maintainer" },
+      "replies" => { "nodes" => [reply], "pageInfo" => { "hasNextPage" => true, "endCursor" => "next" } } }
+    @runner.define_singleton_method(:graphql_query) do |_query|
+      { "data" => { "node" => { "replies" => { "nodes" => [reply.merge("id" => "reply2")], "pageInfo" => {} } } } }
+    end
+    items = []
+    @runner.send(:collect_discussion_comment, "shakacode", "example", 1, "Discussion", comment, @cutoff, Set["maintainer"], Set.new, items)
+    assert_equal %w[discussion_comment:reply1 discussion_comment:reply2], items.map { |item| item[:id] }
+  end
+
+  def test_humans_named_like_bots_are_not_suppressed
+    @runner.define_singleton_method(:fetch_trusted_actors_graphql) { "trusted_bots: [claude]\ntrusted_metadata_bots: [github-actions]\ntrusted_teams: [shakacode]\ntrusted_users: [maintainer]\n" }
+    trusted = @runner.send(:fetch_trusted_actors)[:trusted].to_set
+    assert @runner.send(:outside_actor?, { "login" => "claude", "type" => "User" }, trusted)
+    assert @runner.send(:outside_actor?, { "login" => "shakacode", "type" => "User" }, trusted)
+    refute @runner.send(:outside_actor?, { "login" => "claude", "type" => "Bot" }, trusted)
+  end
+end
+
+class MonitorRegressionTest
+  def test_successful_dry_run_with_activity_does_not_send_or_advance_state
+    writes = []
+    sends = []
+    @runner.define_singleton_method(:read_state) { { "last_successful_run_at" => "2026-10-31T00:00:00Z" } }
+    @runner.define_singleton_method(:fetch_team_members) { |*_args| [] }
+    @runner.define_singleton_method(:fetch_trusted_actors) { { trusted: [], counts: {} } }
+    @runner.define_singleton_method(:paged_array) do |*_args|
+      [{ "name" => "example", "full_name" => "shakacode/example", "pushed_at" => Time.now.utc.iso8601 }]
+    end
+    @runner.define_singleton_method(:initial_repository_pages) { |*_args| { "shakacode/example" => { "issues" => {}, "pullRequests" => {} } } }
+    @runner.define_singleton_method(:collect_issues) do |*_args, **_kwargs|
+      _args.last << { repository: "shakacode/example", activity_type: "new issue", author: "outside", summary: "issue" }
+    end
+    %i[collect_issue_comments collect_pull_requests collect_pull_review_comments].each do |method|
+      @runner.define_singleton_method(method) { |*_args| nil }
+    end
+    @runner.define_singleton_method(:safe_write) { |path, data| writes << [path, data] }
+    @runner.define_singleton_method(:post_slack) { |text| sends << text; true }
+    previous = ENV["MONITOR_DRY_RUN"]
+    begin
+      ENV["MONITOR_DRY_RUN"] = "1"
+      error = assert_raises(SystemExit) { capture_io { @runner.send(:run) } }
+      assert_equal 0, error.status
+      assert_empty sends
+      assert_equal [RESULT_PATH], writes.map(&:first)
+      refute writes.last.last[:state_updated]
+      assert_equal 1, writes.last.last[:outside_activity_count]
+      assert_equal "completed", writes.last.last[:result_status]
+    ensure
+      ENV["MONITOR_DRY_RUN"] = previous
+    end
+  end
+end
+
+class MonitorRegressionTest
+  def test_environment_can_only_tighten_hard_request_budget
+    output, error, status = Open3.capture3({ "MONITOR_MAX_API_REQUESTS" => "1000" }, RbConfig.ruby, "-e",
+      'load ARGV.fetch(0); print REQUEST_BUDGET.limit', File.expand_path("../bin/monitor_outside_activity", __dir__))
+    assert status.success?, error
+    assert_equal "600", output
+  end
+
+  def test_atomic_state_replacement_preserves_old_file_when_rename_fails
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "state.json")
+      File.write(path, '{"old":true}')
+      original = File.method(:rename)
+      File.define_singleton_method(:rename) { |*_args| raise IOError, "rename failed" }
+      begin
+        assert_raises(IOError) { @runner.send(:safe_write, path, { new: true }) }
+        assert_equal '{"old":true}', File.read(path)
+        assert_equal ["state.json"], Dir.children(dir)
+      ensure
+        File.define_singleton_method(:rename, original)
+      end
+      @runner.send(:safe_write, path, { new: true })
+      assert_equal({ "new" => true }, JSON.parse(File.read(path)))
+    end
+  end
+end
+
+class MonitorRegressionTest
+  def test_dismissed_submissions_are_included_but_pending_reviews_are_not
+    reviews = %w[DISMISSED PENDING].map do |state|
+      { "id" => state, "node_id" => state, "state" => state, "submitted_at" => @cutoff.iso8601,
+        "user" => { "login" => "outside", "type" => "User" }, "html_url" => "https://github.com/example/review" }
+    end
+    items = []
+    @runner.send(:collect_pr_reviews, "shakacode", "example", 1, "PR", @cutoff, Set.new, Set.new, items, reviews: reviews)
+    assert_equal ["pull_review:DISMISSED"], items.map { |item| item[:id] }
+  end
+end
+
+class MonitorRegressionTest
+  def test_large_activity_alert_is_split_and_partial_delivery_raises
+    item = { repository: "shakacode/example", activity_type: "review", summary: "a" * 100,
+      link: "https://github.com/shakacode/example/pull/1", author: "outside", outside_because: "outside", suggested_next_action: "review" }
+    messages = []
+    @runner.define_singleton_method(:post_slack) { |text| messages << text; true }
+    @runner.send(:post_activity_messages, Array.new(400, item), @cutoff, @cutoff)
+    assert_operator messages.length, :>, 1
+    assert messages.all? { |message| message.length <= 30_000 }
+    assert_equal 400, messages.sum { |message| message.scan('author: outside').length }
+    calls = 0
+    @runner.define_singleton_method(:post_slack) { |_text| calls += 1; raise "delivery failed" if calls == 2 }
+    assert_raises(RuntimeError) { @runner.send(:post_activity_messages, Array.new(400, item), @cutoff, @cutoff) }
+    assert_equal 2, calls
+  end
+end
+
+class MonitorRegressionTest
+  def test_initial_issue_and_pr_pages_are_shared_between_two_repositories
+    query = nil
+    @runner.define_singleton_method(:graphql_query) do |value|
+      query = value
+      { "data" => { "repo0" => { "issues" => { "nodes" => [] }, "pullRequests" => {} }, "repo1" => { "issues" => {}, "pullRequests" => {} } } }
+    end
+    repos = %w[first second].map { |name| { "name" => name, "full_name" => "shakacode/#{name}" } }
+    pages = @runner.send(:initial_repository_pages, repos, @cutoff)
+    assert_equal %w[shakacode/first shakacode/second], pages.keys
+    assert_includes query, 'repo0: repository'
+    assert_includes query, 'repo1: repository'
+    assert_includes query, 'issues(first:100, filterBy:{since:'
+    assert_includes query, 'pullRequests(first:50'
+  end
+
+  def test_issue_pagination_filters_by_own_creation_and_actor
+    issue = { "id" => "newissue", "number" => 2, "title" => "New issue", "url" => "https://github.com/shakacode/example/issues/2",
+      "createdAt" => @cutoff.iso8601, "author" => { "login" => "outside", "__typename" => "User" } }
+    first = { "nodes" => [issue.merge("id" => "oldissue", "createdAt" => "2020-01-01T00:00:00Z")], "pageInfo" => { "hasNextPage" => true, "endCursor" => "next" } }
+    @runner.define_singleton_method(:graphql_query) do |_query|
+      { "data" => { "repository" => { "issues" => { "nodes" => [issue], "pageInfo" => {} } } } }
+    end
+    items = []
+    @runner.send(:collect_issues, "shakacode", "example", "shakacode/example", @cutoff, Set.new, Set.new, items, initial_connection: first)
+    assert_equal ["issue:newissue"], items.map { |item| item[:id] }
+  end
+end
+
+class MonitorRegressionTest
+  def test_mid_scan_failure_preserves_success_state_and_reports_blocker
+    writes = []
+    alerts = []
+    @runner.define_singleton_method(:read_state) { { "last_successful_run_at" => "2026-10-31T00:00:00Z" } }
+    @runner.define_singleton_method(:fetch_team_members) { |*_args| [] }
+    @runner.define_singleton_method(:fetch_trusted_actors) { { trusted: [], counts: {} } }
+    @runner.define_singleton_method(:paged_array) do |*_args|
+      [{ "name" => "example", "full_name" => "shakacode/example", "pushed_at" => Time.now.utc.iso8601 }]
+    end
+    @runner.define_singleton_method(:initial_repository_pages) do |*_args|
+      { "shakacode/example" => { "issues" => { "nodes" => [], "pageInfo" => {} }, "pullRequests" => {} } }
+    end
+    @runner.define_singleton_method(:collect_issue_comments) { |*_args| nil }
+    @runner.define_singleton_method(:collect_pull_requests) { |*_args, **_kwargs| raise OpenSourceUtils::RequestBudgetExceeded, "mid-scan budget failure" }
+    @runner.define_singleton_method(:safe_write) { |path, data| writes << [path, data] }
+    @runner.define_singleton_method(:post_slack) { |text| alerts << text; true }
+    previous = ENV.values_at("MONITOR_DRY_RUN", "MONITOR_REPO")
+    begin
+      ENV.delete("MONITOR_DRY_RUN")
+      ENV.delete("MONITOR_REPO")
+      error = assert_raises(SystemExit) { capture_io { @runner.send(:run) } }
+      assert_equal 2, error.status
+      assert_equal [RESULT_PATH], writes.map(&:first)
+      result = writes.last.last
+      refute result[:state_updated]
+      assert_equal "attention_needed", result[:result_status]
+      assert_includes result[:blockers].join, "mid-scan budget failure"
+      assert_equal 1, alerts.length
+      assert_includes alerts.first, 'monitor blocked'
+    ensure
+      ENV["MONITOR_DRY_RUN"], ENV["MONITOR_REPO"] = previous
+    end
+  end
+end

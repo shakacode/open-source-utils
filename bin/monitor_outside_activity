@@ -432,7 +432,7 @@ def collect_pr_reviews(owner, repo, pr_number, title, start_time, trusted, repor
     next unless (submitted = parse_time(review["submitted_at"])) && submitted >= start_time
 
     review_state = review["state"].to_s
-    next unless %w[COMMENTED APPROVED CHANGES_REQUESTED].include?(review_state)
+    next unless %w[COMMENTED APPROVED CHANGES_REQUESTED DISMISSED].include?(review_state)
     next unless outside_actor?(review["user"], trusted)
 
     activity_type = review_state == "CHANGES_REQUESTED" ? "requested changes" : "new pull request review"

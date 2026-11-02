@@ -235,3 +235,15 @@ class MonitorRegressionTest
     end
   end
 end
+
+class MonitorRegressionTest
+  def test_dismissed_submissions_are_included_but_pending_reviews_are_not
+    reviews = %w[DISMISSED PENDING].map do |state|
+      { "id" => state, "node_id" => state, "state" => state, "submitted_at" => @cutoff.iso8601,
+        "user" => { "login" => "outside", "type" => "User" }, "html_url" => "https://github.com/example/review" }
+    end
+    items = []
+    @runner.send(:collect_pr_reviews, "shakacode", "example", 1, "PR", @cutoff, Set.new, Set.new, items, reviews: reviews)
+    assert_equal ["pull_review:DISMISSED"], items.map { |item| item[:id] }
+  end
+end

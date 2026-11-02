@@ -628,12 +628,7 @@ def collect_discussions(owner, repo, start_time, trusted, reported_ids, items)
     break unless repository["hasDiscussionsEnabled"]
 
     discussions = Array(repository.dig("discussions", "nodes"))
-    reached_cutoff = false
     discussions.each do |discussion|
-      if parse_time(discussion["updatedAt"]) && parse_time(discussion["updatedAt"]) < start_time
-        reached_cutoff = true
-        break
-      end
 
       actor = discussion["author"]
 
@@ -671,7 +666,7 @@ def collect_discussions(owner, repo, start_time, trusted, reported_ids, items)
   end
 end
 
-    break if reached_cutoff || !repository.dig("discussions", "pageInfo", "hasNextPage")
+    break unless repository.dig("discussions", "pageInfo", "hasNextPage")
     after = repository.dig("discussions", "pageInfo", "endCursor")
   end
 end

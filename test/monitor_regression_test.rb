@@ -75,17 +75,21 @@ class MonitorRegressionTest < Minitest::Test
     assert_equal value, JSON.parse('"' + @runner.send(:gq, value) + '"')
   end
 
-  def test_discussion_pagination_stops_at_cutoff
+  def test_old_discussion_update_does_not_hide_recent_comment_on_later_page
     calls = 0
+    cutoff = @cutoff
     @runner.define_singleton_method(:graphql_query) do |_query|
       calls += 1
-      raise "unnecessary request" if calls > 1
+      comment = { "id" => "reply", "createdAt" => cutoff.iso8601, "url" => "https://github.com/discussion#reply", "author" => { "login" => "outside", "__typename" => "User" } }
       { "data" => { "repository" => { "hasDiscussionsEnabled" => true, "discussions" => {
-        "nodes" => [{ "updatedAt" => "2020-01-01T00:00:00Z" }], "pageInfo" => { "hasNextPage" => true }
+        "nodes" => [{ "updatedAt" => "2020-01-01T00:00:00Z", "comments" => { "nodes" => calls == 2 ? [comment] : [] } }],
+        "pageInfo" => { "hasNextPage" => calls == 1, "endCursor" => "next" }
       } } } }
     end
-    @runner.send(:collect_discussions, "shakacode", "example", @cutoff, Set.new, Set.new, [])
-    assert_equal 1, calls
+    items = []
+    @runner.send(:collect_discussions, "shakacode", "example", @cutoff, Set.new, Set.new, items)
+    assert_equal 2, calls
+    assert_equal ["discussion_comment:reply"], items.map { |item| item[:id] }
   end
 
   def test_filtered_run_does_not_advance_shared_watermark_or_send_slack

@@ -34,23 +34,6 @@ ACTIVE_REPO_DAYS = Integer(ENV.fetch("MONITOR_ACTIVE_REPO_DAYS", "365"))
 MAX_GITHUB_API_REQUESTS = Integer(ENV.fetch("MONITOR_MAX_API_REQUESTS", "600"))
 HST_OFFSET = "-10:00"
 REQUEST_BUDGET = OpenSourceUtils::RequestBudget.new(MAX_GITHUB_API_REQUESTS)
-KNOWN_BOT_LOGIN_PREFIXES = [
-  "github-actions",
-  "dependabot",
-  "renovate",
-  "copilot-pull-request-reviewer",
-  "mergify",
-  "release-please",
-  "codex-automation",
-  "chatgpt-codex-connector",
-  "claude",
-  "coderabbitai",
-  "cursor",
-  "greptile-apps",
-  "codecov",
-  "snyk-ci",
-  "release-automation"
-].freeze
 STANDARD_OUTSIDE_REASON = "not in ShakaCode team allowlist or trusted actors file; actor type %<type>s."
 
 def with_retries
@@ -120,11 +103,7 @@ def outside_because(actor)
 end
 
 def bot_actor?(login, type)
-  normalized = login.to_s.downcase
-  return true if type.to_s.casecmp("bot").zero?
-  return true if normalized.end_with?("[bot]")
-
-  KNOWN_BOT_LOGIN_PREFIXES.any? { |prefix| normalized == prefix || normalized.start_with?("#{prefix}[") }
+  type.to_s.casecmp("bot").zero? || login.to_s.downcase.end_with?("[bot]")
 end
 
 def outside_actor?(actor, trusted)
@@ -167,8 +146,8 @@ def read_state
   return {} unless File.exist?(STATE_PATH)
 
   JSON.parse(File.read(STATE_PATH))
-rescue StandardError
-  {}
+rescue JSON::ParserError => e
+  raise "Monitor state is invalid at #{STATE_PATH}: #{e.message}"
 end
 
 def safe_write(path, payload)
@@ -216,7 +195,7 @@ def normalize_reported_records(state, now)
   records
 end
 
-def fetch_team_members
+def fetch_team_members(team = TEAM)
   members = []
   query = <<~GRAPHQL
     query($org:String!,$team:String!,$after:String){
@@ -233,7 +212,7 @@ def fetch_team_members
 
   cursor = nil
   loop do
-    data = graphql_query(query, { "org" => ORG, "team" => TEAM, "after" => cursor }.compact)
+    data = graphql_query(query, { "org" => ORG, "team" => team, "after" => cursor }.compact)
     nodes = data.dig("data", "organization", "team", "members")
     raise "team membership data missing" unless nodes
 
@@ -245,7 +224,7 @@ def fetch_team_members
   members.reject(&:empty?).uniq
 rescue StandardError => e
   raise if e.is_a?(OpenSourceUtils::RequestBudgetExceeded) || OpenSourceUtils::MonitorSupport.rate_limit_error?(e.message)
-  paged_array("/orgs/#{ORG}/teams/#{TEAM}/members").map { |member| parse_login(member["login"]) }
+  paged_array("/orgs/#{ORG}/teams/#{team}/members").map { |member| parse_login(member["login"]) }
 end
 
 def fetch_trusted_actors
@@ -264,7 +243,7 @@ def fetch_trusted_actors
   extras = parsed.is_a?(Hash) ? parse_yaml_values(parsed["trusted_actors"]) : parse_yaml_values(parsed)
   extras = extras.map { |v| parse_login(v) }.reject(&:empty?)
 
-  all = (users + bots + metadata_bots + teams + extras).map { |v| parse_login(v) }.reject(&:empty?).uniq
+  all = (users + extras).map { |v| parse_login(v) }.reject(&:empty?).uniq
 
   {
     users: users,
@@ -537,6 +516,36 @@ def collect_pull_review_comments(owner, repo, full_name, start_time, trusted, re
   end
 end
 
+def collect_discussion_comment(owner, repo, number, title, comment, start_time, trusted, reported_ids, items)
+  if (created = parse_time(comment["createdAt"])) && created >= start_time && outside_actor?(comment["author"], trusted)
+    add_item(items, reported_ids, id: "discussion_comment:#{comment.fetch('id')}",
+      repository: "#{owner}/#{repo}", activity_type: "new GitHub Discussion comment",
+      actor: comment["author"], link: comment["url"], summary: "Discussion comment on ##{number}: #{title}",
+      outside_because: outside_because(comment["author"]),
+      action: "Review the discussion comment and decide whether a maintainer response is needed.")
+  end
+  replies = comment["replies"]
+  return unless replies
+
+  loop do
+    replies.fetch("nodes").each do |reply|
+      collect_discussion_comment(owner, repo, number, title, reply, start_time, trusted, reported_ids, items)
+    end
+    break unless replies.dig("pageInfo", "hasNextPage")
+
+    query = <<~GRAPHQL
+      query { node(id:"#{gq(comment.fetch('id'))}") { ... on DiscussionComment {
+        replies(first:100, after:"#{gq(replies.dig('pageInfo', 'endCursor'))}") {
+          nodes { id url createdAt author { login __typename } }
+          pageInfo { hasNextPage endCursor }
+        }
+      } } }
+    GRAPHQL
+    replies = graphql_query(query).dig("data", "node", "replies")
+    raise "Discussion replies missing for #{comment['id']}" unless replies
+  end
+end
+
 def collect_discussion_comments(owner, repo, discussion_number, title, start_time, trusted, reported_ids, items, after = nil)
   loop do
     query = <<~GRAPHQL
@@ -544,7 +553,7 @@ def collect_discussion_comments(owner, repo, discussion_number, title, start_tim
         repository(owner:"#{gq(owner)}",name:"#{gq(repo)}"){
           discussion(number:#{discussion_number}){
             comments(first:100#{", after: \"#{gq(after)}\"" if after}){
-              nodes{id url createdAt author{login __typename}}
+              nodes{id url createdAt author{login __typename} replies(first:100){nodes{id url createdAt author{login __typename}} pageInfo{hasNextPage endCursor}}}
               pageInfo{hasNextPage endCursor}
             }
           }
@@ -557,21 +566,7 @@ def collect_discussion_comments(owner, repo, discussion_number, title, start_tim
     break unless comment_connection
 
     Array(comment_connection["nodes"]).each do |comment|
-      next unless (created = parse_time(comment["createdAt"])) && created >= start_time
-      next unless outside_actor?(comment["author"], trusted)
-
-      add_item(
-        items,
-        reported_ids,
-        id: "discussion_comment:#{comment["id"]}",
-        repository: "#{owner}/#{repo}",
-        activity_type: "new GitHub Discussion comment",
-        actor: comment["author"],
-        link: comment["url"],
-        summary: "Discussion comment on ##{discussion_number}: #{title}",
-        outside_because: outside_because(comment["author"]),
-        action: "Review the discussion comment and decide whether a maintainer response is needed."
-      )
+      collect_discussion_comment(owner, repo, discussion_number, title, comment, start_time, trusted, reported_ids, items)
     end
 
     break unless comment_connection.dig("pageInfo", "hasNextPage")
@@ -586,10 +581,10 @@ def collect_discussions(owner, repo, start_time, trusted, reported_ids, items)
       query{
         repository(owner:"#{gq(owner)}",name:"#{gq(repo)}"){
           hasDiscussionsEnabled
-          discussions(first:50#{", after: \"#{gq(after)}\"" if after}, orderBy:{field:UPDATED_AT,direction:DESC}){
+          discussions(first:20#{", after: \"#{gq(after)}\"" if after}, orderBy:{field:UPDATED_AT,direction:DESC}){
             nodes{
               id number title url createdAt updatedAt author{login __typename}
-              comments(first:100){nodes{id url createdAt author{login __typename}} pageInfo{hasNextPage endCursor}}
+              comments(first:100){nodes{id url createdAt author{login __typename} replies(first:100){nodes{id url createdAt author{login __typename}} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}
             }
             pageInfo{hasNextPage endCursor}
           }
@@ -641,24 +636,10 @@ def collect_discussions(owner, repo, start_time, trusted, reported_ids, items)
         )
       end
 
-      Array(discussion.dig("comments", "nodes")).each do |comment|
-        next unless (created = parse_time(comment["createdAt"])) && created >= start_time
-        next unless outside_actor?(comment["author"], trusted)
-
-        add_item(
-          items,
-          reported_ids,
-          id: "discussion_comment:#{comment["id"]}",
-          repository: "#{owner}/#{repo}",
-          activity_type: "new GitHub Discussion comment",
-          actor: comment["author"],
-          link: comment["url"],
-          summary: "Discussion comment on ##{discussion["number"]}: #{discussion["title"]}",
-          outside_because: outside_because(comment["author"]),
-          action: "Review the discussion comment and decide whether a maintainer response is needed."
-        )
-      end
-    end
+  Array(discussion.dig("comments", "nodes")).each do |comment|
+    collect_discussion_comment(owner, repo, discussion["number"], discussion["title"], comment, start_time, trusted, reported_ids, items)
+  end
+end
 
     break if reached_cutoff || !repository.dig("discussions", "pageInfo", "hasNextPage")
     after = repository.dig("discussions", "pageInfo", "endCursor")
@@ -666,15 +647,22 @@ def collect_discussions(owner, repo, start_time, trusted, reported_ids, items)
 end
 
 def run
-diagnostic = !ENV['MONITOR_REPO'].to_s.empty?
-state = read_state
+repo_filter = ENV['MONITOR_REPO'].to_s.strip
+diagnostic = !repo_filter.empty? || ENV['MONITOR_DRY_RUN'] == '1'
+state_error = nil
+state = begin
+  read_state
+rescue StandardError => e
+  state_error = e.message
+  {}
+end
 state_read = File.exist?(STATE_PATH)
 start_time, ended_at = compute_window(state)
 activity_cutoff = ended_at - (ACTIVE_REPO_DAYS * 24 * 60 * 60)
 reported_records = normalize_reported_records(state, ended_at)
 reported_ids = reported_records.keys.to_set
 
-blockers = []
+blockers = state_error ? [state_error] : []
 team_members = []
 trusted_payload = {
   users: [],
@@ -689,7 +677,8 @@ trusted = Set.new
 begin
   team_members = fetch_team_members
   trusted_payload = fetch_trusted_actors
-  trusted = (team_members + trusted_payload.fetch(:trusted, [])).uniq.to_set
+  additional_members = trusted_payload.fetch(:teams, []).reject { |team| team == TEAM }.flat_map { |team| fetch_team_members(team) }
+  trusted = (team_members + additional_members + trusted_payload.fetch(:trusted, [])).uniq.to_set
 rescue StandardError => e
   blockers << "allowlist refresh failed: #{e.message}"
 end
@@ -709,13 +698,15 @@ if blockers.empty?
       !repo["private"] && !repo["archived"] && !repo["disabled"]
     end
 
-    if diagnostic
-      repos = discovered_repos.select { |repo| repo.fetch("full_name", "") == ENV["MONITOR_REPO"].strip }
+    if !repo_filter.empty?
+      repos = discovered_repos.select { |repo| repo.fetch("full_name", "") == repo_filter }
     else
       repos = discovered_repos.select do |repo|
         OpenSourceUtils::MonitorSupport.active_repository?(repo, activity_cutoff)
       end
     end
+
+    raise "No eligible public repository matches MONITOR_REPO=#{repo_filter}" if !repo_filter.empty? && repos.empty?
 
     minimum_scan_requests = OpenSourceUtils::MonitorSupport.minimum_scan_requests(repos)
     REQUEST_BUDGET.ensure_capacity!(minimum_scan_requests)
@@ -813,8 +804,8 @@ result = {
 if blockers.any?
   blockers << "scan status: state not advanced" unless state_updated
   begin
-    post_slack(build_blocked_message(blockers, start_time, ended_at))
-    result[:slack_sent] = true
+    post_slack(build_blocked_message(blockers, start_time, ended_at)) unless diagnostic
+    result[:slack_sent] = !diagnostic
   rescue StandardError => e
     result[:slack_error] = e.message unless slack_error
     slack_error ||= e.message

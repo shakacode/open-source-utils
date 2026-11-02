@@ -62,7 +62,7 @@ The defaults can be tightened for diagnostics:
 | `MONITOR_MAX_API_REQUESTS` | `600` | Hard request ceiling for the run |
 | `MONITOR_REPO` | unset | Force one exact repository for a bounded diagnostic run |
 
-Filtered `MONITOR_REPO` diagnostics do not send activity alerts or advance the shared
+Filtered `MONITOR_REPO` diagnostics and `MONITOR_DRY_RUN=1` scans do not send alerts or advance the shared
 success watermark. Their result records `diagnostic: true`.
 
 The current ShakaCode catalog has about 200 public, non-archived repositories.

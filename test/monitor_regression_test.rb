@@ -140,3 +140,26 @@ class MonitorRegressionTest
     end
   end
 end
+
+class MonitorRegressionTest
+  def test_replies_on_old_internal_comments_are_collected_and_paginated
+    actor = { "login" => "outside", "__typename" => "User" }
+    reply = { "id" => "reply1", "url" => "https://github.com/discussion#reply1", "createdAt" => @cutoff.iso8601, "author" => actor }
+    comment = { "id" => "root", "createdAt" => "2020-01-01T00:00:00Z", "author" => { "login" => "maintainer" },
+      "replies" => { "nodes" => [reply], "pageInfo" => { "hasNextPage" => true, "endCursor" => "next" } } }
+    @runner.define_singleton_method(:graphql_query) do |_query|
+      { "data" => { "node" => { "replies" => { "nodes" => [reply.merge("id" => "reply2")], "pageInfo" => {} } } } }
+    end
+    items = []
+    @runner.send(:collect_discussion_comment, "shakacode", "example", 1, "Discussion", comment, @cutoff, Set["maintainer"], Set.new, items)
+    assert_equal %w[discussion_comment:reply1 discussion_comment:reply2], items.map { |item| item[:id] }
+  end
+
+  def test_humans_named_like_bots_are_not_suppressed
+    @runner.define_singleton_method(:fetch_trusted_actors_graphql) { "trusted_bots: [claude]\ntrusted_metadata_bots: [github-actions]\ntrusted_teams: [shakacode]\ntrusted_users: [maintainer]\n" }
+    trusted = @runner.send(:fetch_trusted_actors)[:trusted].to_set
+    assert @runner.send(:outside_actor?, { "login" => "claude", "type" => "User" }, trusted)
+    assert @runner.send(:outside_actor?, { "login" => "shakacode", "type" => "User" }, trusted)
+    refute @runner.send(:outside_actor?, { "login" => "claude", "type" => "Bot" }, trusted)
+  end
+end

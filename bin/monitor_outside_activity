@@ -9,6 +9,7 @@ require "net/http"
 require "open3"
 require "set"
 require "time"
+require "tempfile"
 require "uri"
 require "yaml"
 
@@ -31,7 +32,7 @@ FIRST_RUN_DAYS = 60
 OVERLAP_SECONDS = 5 * 60
 REPORT_RETENTION_DAYS = 120
 ACTIVE_REPO_DAYS = Integer(ENV.fetch("MONITOR_ACTIVE_REPO_DAYS", "365"))
-MAX_GITHUB_API_REQUESTS = Integer(ENV.fetch("MONITOR_MAX_API_REQUESTS", "600"))
+MAX_GITHUB_API_REQUESTS = [Integer(ENV.fetch("MONITOR_MAX_API_REQUESTS", "600")), 600].min
 HST_OFFSET = "-10:00"
 REQUEST_BUDGET = OpenSourceUtils::RequestBudget.new(MAX_GITHUB_API_REQUESTS)
 STANDARD_OUTSIDE_REASON = "not in ShakaCode team allowlist or trusted actors file; actor type %<type>s."
@@ -152,7 +153,12 @@ end
 
 def safe_write(path, payload)
   FileUtils.mkdir_p(File.dirname(path))
-  File.write(path, JSON.pretty_generate(payload) + "\n")
+Tempfile.create([".oss-monitor-", ".json"], File.dirname(path)) do |file|
+  file.write(JSON.pretty_generate(payload) + "\n")
+  file.flush
+  file.fsync
+  File.rename(file.path, path)
+end
 end
 
 def compute_window(state)
@@ -488,30 +494,30 @@ def collect_pull_requests(owner, repo, full_name, start_time, trusted, reported_
       end
 
       reviews = pr.fetch("reviews")
-  collect_graphql_reviews(owner, repo, pr, reviews, start_time, trusted, reported_ids, items)
-end
-pending = connection.fetch("nodes").select { |pr| pr.dig("reviews", "pageInfo", "hasNextPage") }
-until pending.empty?
-  batch = pending.shift(10)
-  fields = batch.each_with_index.map do |pr, index|
-    <<~GRAPHQL
-      pr#{index}: node(id:"#{gq(pr.fetch('id'))}") { ... on PullRequest {
-        reviews(first:100, after:"#{gq(pr.dig('reviews', 'pageInfo', 'endCursor'))}") {
-          nodes { id state submittedAt url author { login __typename } }
-          pageInfo { hasNextPage endCursor }
-        }
-      } }
-    GRAPHQL
-  end.join(" ")
-  data = graphql_query("query { #{fields} }").fetch("data")
-  batch.each_with_index do |pr, index|
-    reviews = data.dig("pr#{index}", "reviews")
-    raise "Review data missing for #{full_name} PR #{pr['number']}" unless reviews
-    collect_graphql_reviews(owner, repo, pr, reviews, start_time, trusted, reported_ids, items)
-    pr["reviews"] = reviews
-    pending << pr if reviews.dig("pageInfo", "hasNextPage")
-  end
-end
+      collect_graphql_reviews(owner, repo, pr, reviews, start_time, trusted, reported_ids, items)
+    end
+    pending = connection.fetch("nodes").select { |pr| pr.dig("reviews", "pageInfo", "hasNextPage") }
+    until pending.empty?
+      batch = pending.shift(10)
+      fields = batch.each_with_index.map do |pr, index|
+        <<~GRAPHQL
+          pr#{index}: node(id:"#{gq(pr.fetch('id'))}") { ... on PullRequest {
+            reviews(first:100, after:"#{gq(pr.dig('reviews', 'pageInfo', 'endCursor'))}") {
+              nodes { id state submittedAt url author { login __typename } }
+              pageInfo { hasNextPage endCursor }
+            }
+          } }
+        GRAPHQL
+      end.join(" ")
+      data = graphql_query("query { #{fields} }").fetch("data")
+      batch.each_with_index do |pr, index|
+        reviews = data.dig("pr#{index}", "reviews")
+        raise "Review data missing for #{full_name} PR #{pr['number']}" unless reviews
+        collect_graphql_reviews(owner, repo, pr, reviews, start_time, trusted, reported_ids, items)
+        pr["reviews"] = reviews
+        pending << pr if reviews.dig("pageInfo", "hasNextPage")
+      end
+    end
     break unless connection.dig("pageInfo", "hasNextPage")
     after = connection.dig("pageInfo", "endCursor")
   end
@@ -671,198 +677,198 @@ end
 end
 
 def run
-repo_filter = ENV['MONITOR_REPO'].to_s.strip
-diagnostic = !repo_filter.empty? || ENV['MONITOR_DRY_RUN'] == '1'
-state_error = nil
-state = begin
-  read_state
-rescue StandardError => e
-  state_error = e.message
-  {}
-end
-state_read = File.exist?(STATE_PATH)
-start_time, ended_at = compute_window(state)
-activity_cutoff = ended_at - (ACTIVE_REPO_DAYS * 24 * 60 * 60)
-reported_records = normalize_reported_records(state, ended_at)
-reported_ids = reported_records.keys.to_set
+  repo_filter = ENV['MONITOR_REPO'].to_s.strip
+  diagnostic = !repo_filter.empty? || ENV['MONITOR_DRY_RUN'] == '1'
+  state_error = nil
+  state = begin
+    read_state
+  rescue StandardError => e
+    state_error = e.message
+    {}
+  end
+  state_read = File.exist?(STATE_PATH)
+  start_time, ended_at = compute_window(state)
+  activity_cutoff = ended_at - (ACTIVE_REPO_DAYS * 24 * 60 * 60)
+  reported_records = normalize_reported_records(state, ended_at)
+  reported_ids = reported_records.keys.to_set
 
-blockers = state_error ? [state_error] : []
-team_members = []
-trusted_payload = {
-  users: [],
-  bots: [],
-  metadata_bots: [],
-  teams: [],
-  counts: { users: 0, bots: 0, metadata_bots: 0, teams: 0, trusted_unique: 0 },
-  trusted: []
-}
-trusted = Set.new
+  blockers = state_error ? [state_error] : []
+  team_members = []
+  trusted_payload = {
+    users: [],
+    bots: [],
+    metadata_bots: [],
+    teams: [],
+    counts: { users: 0, bots: 0, metadata_bots: 0, teams: 0, trusted_unique: 0 },
+    trusted: []
+  }
+  trusted = Set.new
 
-begin
-  team_members = fetch_team_members
-  trusted_payload = fetch_trusted_actors
-  additional_members = trusted_payload.fetch(:teams, []).reject { |team| team == TEAM }.flat_map { |team| fetch_team_members(team) }
-  trusted = (team_members + additional_members + trusted_payload.fetch(:trusted, [])).uniq.to_set
-rescue StandardError => e
-  blockers << "allowlist refresh failed: #{e.message}"
-end
-
-repos = []
-discovered_repos = []
-minimum_scan_requests = 0
-items = []
-issue_cache = {}
-state_updated = false
-slack_error = nil
-slack_sent = false
-
-if blockers.empty?
   begin
-    discovered_repos = paged_array("/orgs/#{ORG}/repos?type=public").select do |repo|
-      !repo["private"] && !repo["archived"] && !repo["disabled"]
-    end
+    team_members = fetch_team_members
+    trusted_payload = fetch_trusted_actors
+    additional_members = trusted_payload.fetch(:teams, []).reject { |team| team == TEAM }.flat_map { |team| fetch_team_members(team) }
+    trusted = (team_members + additional_members + trusted_payload.fetch(:trusted, [])).uniq.to_set
+  rescue StandardError => e
+    blockers << "allowlist refresh failed: #{e.message}"
+  end
 
-    if !repo_filter.empty?
-      repos = discovered_repos.select { |repo| repo.fetch("full_name", "") == repo_filter }
-    else
-      repos = discovered_repos.select do |repo|
-        OpenSourceUtils::MonitorSupport.active_repository?(repo, activity_cutoff)
+  repos = []
+  discovered_repos = []
+  minimum_scan_requests = 0
+  items = []
+  issue_cache = {}
+  state_updated = false
+  slack_error = nil
+  slack_sent = false
+
+  if blockers.empty?
+    begin
+      discovered_repos = paged_array("/orgs/#{ORG}/repos?type=public").select do |repo|
+        !repo["private"] && !repo["archived"] && !repo["disabled"]
       end
+
+      if !repo_filter.empty?
+        repos = discovered_repos.select { |repo| repo.fetch("full_name", "") == repo_filter }
+      else
+        repos = discovered_repos.select do |repo|
+          OpenSourceUtils::MonitorSupport.active_repository?(repo, activity_cutoff)
+        end
+      end
+
+      raise "No eligible public repository matches MONITOR_REPO=#{repo_filter}" if !repo_filter.empty? && repos.empty?
+
+      minimum_scan_requests = OpenSourceUtils::MonitorSupport.minimum_scan_requests(repos)
+      REQUEST_BUDGET.ensure_capacity!(minimum_scan_requests)
+
+      repos.each_with_index do |repo, index|
+        name = repo.fetch("name")
+        full_name = repo.fetch("full_name")
+        warn "scanning #{index + 1}/#{repos.length} #{full_name}"
+
+        collect_issues(ORG, name, full_name, start_time, trusted, reported_ids, items)
+        collect_issue_comments(ORG, name, full_name, start_time, trusted, reported_ids, items, issue_cache)
+        collect_pull_requests(ORG, name, full_name, start_time, trusted, reported_ids, items)
+        collect_pull_review_comments(ORG, name, full_name, start_time, trusted, reported_ids, items)
+        collect_discussions(ORG, name, start_time, trusted, reported_ids, items) if repo["has_discussions"]
+      end
+    rescue StandardError => e
+      blockers << "scan failed: #{e.message}"
     end
+  end
 
-    raise "No eligible public repository matches MONITOR_REPO=#{repo_filter}" if !repo_filter.empty? && repos.empty?
+  items.sort_by! { |item| [item[:repository], item[:activity_type], item[:author], item[:summary]] }
 
-    minimum_scan_requests = OpenSourceUtils::MonitorSupport.minimum_scan_requests(repos)
-    REQUEST_BUDGET.ensure_capacity!(minimum_scan_requests)
-
-    repos.each_with_index do |repo, index|
-      name = repo.fetch("name")
-      full_name = repo.fetch("full_name")
-      warn "scanning #{index + 1}/#{repos.length} #{full_name}"
-
-      collect_issues(ORG, name, full_name, start_time, trusted, reported_ids, items)
-      collect_issue_comments(ORG, name, full_name, start_time, trusted, reported_ids, items, issue_cache)
-      collect_pull_requests(ORG, name, full_name, start_time, trusted, reported_ids, items)
-      collect_pull_review_comments(ORG, name, full_name, start_time, trusted, reported_ids, items)
-      collect_discussions(ORG, name, start_time, trusted, reported_ids, items) if repo["has_discussions"]
+  if !diagnostic && blockers.empty? && items.any?
+    begin
+      post_slack(build_activity_message(items, start_time, ended_at))
+      slack_sent = true
+    rescue StandardError => e
+      slack_error = e.message
     end
-  rescue StandardError => e
-    blockers << "scan failed: #{e.message}"
   end
-end
 
-items.sort_by! { |item| [item[:repository], item[:activity_type], item[:author], item[:summary]] }
+  if !diagnostic && blockers.empty? && (items.empty? || slack_sent)
+    cutoff = ended_at - (REPORT_RETENTION_DAYS * 24 * 60 * 60)
+    updated_records = reported_records.dup
+    items.each { |item| updated_records[item[:id]] = ended_at }
+    updated_records = updated_records.select { |_, seen_at| seen_at >= cutoff }
 
-if !diagnostic && blockers.empty? && items.any?
-  begin
-    post_slack(build_activity_message(items, start_time, ended_at))
-    slack_sent = true
-  rescue StandardError => e
-    slack_error = e.message
+    state_payload = {
+      last_successful_run_at: ended_at.iso8601,
+      repository_count: repos.length,
+      discovered_repository_count: discovered_repos.length,
+      repository_activity_cutoff: activity_cutoff.iso8601,
+      api_requests_used: REQUEST_BUDGET.used,
+      api_request_budget: REQUEST_BUDGET.limit,
+      minimum_scan_requests: minimum_scan_requests,
+      team_count: team_members.length,
+      trusted_users: trusted_payload.fetch(:counts, {})["users"] || trusted_payload.fetch(:counts, {})[:users],
+      trusted_bots: trusted_payload.fetch(:counts, {})["bots"] || trusted_payload.fetch(:counts, {})[:bots],
+      trusted_metadata_bots: trusted_payload.fetch(:counts, {})["metadata_bots"] || trusted_payload.fetch(:counts, {})[:metadata_bots],
+      trusted_teams: trusted_payload.fetch(:counts, {})["teams"] || trusted_payload.fetch(:counts, {})[:teams],
+      trusted_unique: trusted.length,
+      allowlist_refresh_status: "ok",
+      run_status: items.empty? ? "no_outside_activity" : "outside_activity_reported",
+      last_reported_activity_ids: updated_records.map { |id, seen_at| { id: id, seen_at: seen_at.iso8601 } }
+    }
+    safe_write(STATE_PATH, state_payload)
+    state_updated = true
   end
-end
 
-if !diagnostic && blockers.empty? && (items.empty? || slack_sent)
-  cutoff = ended_at - (REPORT_RETENTION_DAYS * 24 * 60 * 60)
-  updated_records = reported_records.dup
-  items.each { |item| updated_records[item[:id]] = ended_at }
-  updated_records = updated_records.select { |_, seen_at| seen_at >= cutoff }
-
-  state_payload = {
-    last_successful_run_at: ended_at.iso8601,
+  result = {
+    scan_window: {
+      start_utc: start_time.iso8601,
+      end_utc: ended_at.iso8601,
+      start_hst: format_hst(start_time),
+      end_hst: format_hst(ended_at)
+    },
     repository_count: repos.length,
     discovered_repository_count: discovered_repos.length,
     repository_activity_cutoff: activity_cutoff.iso8601,
-    api_requests_used: REQUEST_BUDGET.used,
-    api_request_budget: REQUEST_BUDGET.limit,
-    minimum_scan_requests: minimum_scan_requests,
-    team_count: team_members.length,
-    trusted_users: trusted_payload.fetch(:counts, {})["users"] || trusted_payload.fetch(:counts, {})[:users],
-    trusted_bots: trusted_payload.fetch(:counts, {})["bots"] || trusted_payload.fetch(:counts, {})[:bots],
-    trusted_metadata_bots: trusted_payload.fetch(:counts, {})["metadata_bots"] || trusted_payload.fetch(:counts, {})[:metadata_bots],
-    trusted_teams: trusted_payload.fetch(:counts, {})["teams"] || trusted_payload.fetch(:counts, {})[:teams],
-    trusted_unique: trusted.length,
-    allowlist_refresh_status: "ok",
-    run_status: items.empty? ? "no_outside_activity" : "outside_activity_reported",
-    last_reported_activity_ids: updated_records.map { |id, seen_at| { id: id, seen_at: seen_at.iso8601 } }
+    discussions_repository_count: repos.count { |repo| repo["has_discussions"] },
+    api_requests: {
+      used: REQUEST_BUDGET.used,
+      budget: REQUEST_BUDGET.limit,
+      minimum_scan_requests: minimum_scan_requests
+    },
+    allowlists: {
+      team_members: team_members.length,
+      trusted_users: trusted_payload.fetch(:counts, {})[:users],
+      trusted_bots: trusted_payload.fetch(:counts, {})[:bots],
+      trusted_metadata_bots: trusted_payload.fetch(:counts, {})[:metadata_bots],
+      trusted_teams: trusted_payload.fetch(:counts, {})[:teams],
+      trusted_unique: trusted.length,
+      refresh_status: blockers.empty? ? "ok" : "blocked"
+    },
+    outside_activity_count: items.length,
+    diagnostic: diagnostic,
+    state_read: state_read,
+    state_updated: state_updated,
+    slack_sent: slack_sent,
+    slack_error: slack_error,
+    blockers: blockers,
+    items: items
   }
-  safe_write(STATE_PATH, state_payload)
-  state_updated = true
-end
 
-result = {
-  scan_window: {
-    start_utc: start_time.iso8601,
-    end_utc: ended_at.iso8601,
-    start_hst: format_hst(start_time),
-    end_hst: format_hst(ended_at)
-  },
-  repository_count: repos.length,
-  discovered_repository_count: discovered_repos.length,
-  repository_activity_cutoff: activity_cutoff.iso8601,
-  discussions_repository_count: repos.count { |repo| repo["has_discussions"] },
-  api_requests: {
-    used: REQUEST_BUDGET.used,
-    budget: REQUEST_BUDGET.limit,
-    minimum_scan_requests: minimum_scan_requests
-  },
-  allowlists: {
-    team_members: team_members.length,
-    trusted_users: trusted_payload.fetch(:counts, {})[:users],
-    trusted_bots: trusted_payload.fetch(:counts, {})[:bots],
-    trusted_metadata_bots: trusted_payload.fetch(:counts, {})[:metadata_bots],
-    trusted_teams: trusted_payload.fetch(:counts, {})[:teams],
-    trusted_unique: trusted.length,
-    refresh_status: blockers.empty? ? "ok" : "blocked"
-  },
-  outside_activity_count: items.length,
-  diagnostic: diagnostic,
-  state_read: state_read,
-  state_updated: state_updated,
-  slack_sent: slack_sent,
-  slack_error: slack_error,
-  blockers: blockers,
-  items: items
-}
-
-if blockers.any?
-  blockers << "scan status: state not advanced" unless state_updated
-  begin
-    post_slack(build_blocked_message(blockers, start_time, ended_at)) unless diagnostic
-    result[:slack_sent] = !diagnostic
-  rescue StandardError => e
-    result[:slack_error] = e.message unless slack_error
-    slack_error ||= e.message
+  if blockers.any?
+    blockers << "scan status: state not advanced" unless state_updated
+    begin
+      post_slack(build_blocked_message(blockers, start_time, ended_at)) unless diagnostic
+      result[:slack_sent] = !diagnostic
+    rescue StandardError => e
+      result[:slack_error] = e.message unless slack_error
+      slack_error ||= e.message
+    end
   end
-end
 
-status_label = if blockers.empty? && items.empty?
-  "OUTSIDE ACTIVITY: ZERO"
-else
-  "OUTSIDE ACTIVITY: ATTENTION"
-end
-scan_completed = blockers.empty? && (diagnostic || !items.any? || slack_sent)
-result[:result_status] = scan_completed ? "completed" : "attention_needed"
-result[:result_summary] = if blockers.empty? && items.empty?
-  "No new outside activity found in scan window."
-elsif blockers.empty?
-  "Outside activity detected: #{items.length} item(s) found."
-else
-  "Scan blocked or incomplete: review blockers and rerun."
-end
-result[:result_status_label] = status_label
+  status_label = if blockers.empty? && items.empty?
+    "OUTSIDE ACTIVITY: ZERO"
+  else
+    "OUTSIDE ACTIVITY: ATTENTION"
+  end
+  scan_completed = blockers.empty? && (diagnostic || !items.any? || slack_sent)
+  result[:result_status] = scan_completed ? "completed" : "attention_needed"
+  result[:result_summary] = if blockers.empty? && items.empty?
+    "No new outside activity found in scan window."
+  elsif blockers.empty?
+    "Outside activity detected: #{items.length} item(s) found."
+  else
+    "Scan blocked or incomplete: review blockers and rerun."
+  end
+  result[:result_status_label] = status_label
 
-safe_write(RESULT_PATH, result)
-puts status_label
-puts result[:result_summary]
-puts JSON.pretty_generate(result)
-puts status_label
+  safe_write(RESULT_PATH, result)
+  puts status_label
+  puts result[:result_summary]
+  puts JSON.pretty_generate(result)
+  puts status_label
 
-if blockers.any? || (!diagnostic && items.any? && !slack_sent)
-  exit 2
-else
-  exit 0
-end
+  if blockers.any? || (!diagnostic && items.any? && !slack_sent)
+    exit 2
+  else
+    exit 0
+  end
 end
 
 run if $PROGRAM_NAME == __FILE__

@@ -204,3 +204,30 @@ class MonitorRegressionTest
     end
   end
 end
+
+class MonitorRegressionTest
+  def test_environment_can_only_tighten_hard_request_budget
+    output, error, status = Open3.capture3({ "MONITOR_MAX_API_REQUESTS" => "1000" }, RbConfig.ruby, "-e",
+      'load ARGV.fetch(0); print REQUEST_BUDGET.limit', File.expand_path("../bin/monitor_outside_activity", __dir__))
+    assert status.success?, error
+    assert_equal "600", output
+  end
+
+  def test_atomic_state_replacement_preserves_old_file_when_rename_fails
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "state.json")
+      File.write(path, '{"old":true}')
+      original = File.method(:rename)
+      File.define_singleton_method(:rename) { |*_args| raise IOError, "rename failed" }
+      begin
+        assert_raises(IOError) { @runner.send(:safe_write, path, { new: true }) }
+        assert_equal '{"old":true}', File.read(path)
+        assert_equal ["state.json"], Dir.children(dir)
+      ensure
+        File.define_singleton_method(:rename, original)
+      end
+      @runner.send(:safe_write, path, { new: true })
+      assert_equal({ "new" => true }, JSON.parse(File.read(path)))
+    end
+  end
+end

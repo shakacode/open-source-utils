@@ -7,7 +7,7 @@ Utilities used to maintain and monitor ShakaCode open-source projects.
 `bin/monitor_outside_activity` scans public, active repositories in the
 `shakacode` GitHub organization for new activity from people who are not in
 the organization's maintainer allowlists. It records durable state, suppresses
-known automation accounts, and sends Slack alerts only for actionable activity
+all Bot actors and logins ending in `[bot]`, and sends Slack alerts only for actionable activity
 or blockers.
 
 The monitor is currently run by a Codex automation. Until the initial import PR
@@ -65,11 +65,11 @@ The defaults can be tightened for diagnostics:
 Filtered `MONITOR_REPO` diagnostics and `MONITOR_DRY_RUN=1` scans do not send alerts or advance the shared
 success watermark. Their result records `diagnostic: true`.
 
-The current ShakaCode catalog has about 200 public, non-archived repositories.
-The 12-month activity filter selects about 100, and only a handful currently
-have Discussions enabled. A routine run requires just over 400 requests before
-pagination; the 600-request ceiling leaves bounded headroom for pagination and
-retries without allowing an unexpectedly large scan.
+The minimum estimate is a lower bound, not a guaranteed total. Complete review
+coverage requires visiting historical PRs and paginating their review connections.
+The actual cost grows with repository history and recent comment volume. If the
+600-request ceiling is reached, the run reports a blocker and preserves the
+successful watermark; it never labels a partial scan successful.
 
 GitHub App webhooks remain the best long-term design because they eliminate
 organization-wide polling. Authenticated ETag-based conditional requests are

@@ -21,8 +21,8 @@ SLACK_WEBHOOK_PATH = File.expand_path("~/.codex/codex_slack_webhook_url")
 ORG = "shakacode"
 TEAM = "shakacode"
 TRUSTED_REPO = "react_on_rails"
-TRUSTED_EXPR = "main:.agents/trusted-github-actors.yml"
-TRUSTED_FILE_PATH = ".agents/trusted-github-actors.yml"
+TRUSTED_EXPR = "main:.agents/shaka/trusted-github-actors.yml"
+TRUSTED_FILE_PATH = ".agents/shaka/trusted-github-actors.yml"
 TIMEOUT = "/opt/homebrew/bin/timeout"
 GH_TIMEOUT_SECONDS = "20"
 MAX_RETRIES = 3
@@ -249,7 +249,7 @@ def fetch_trusted_actors
   text = with_retries { fetch_trusted_actors_graphql }
   text = with_retries { fetch_trusted_actors_rest } if text.to_s.strip.empty?
   text = with_retries { fetch_trusted_actors_raw } if text.to_s.strip.empty?
-  raise "trusted actors file is empty" if text.empty?
+  raise "trusted actors file unavailable or empty: #{ORG}/#{TRUSTED_REPO}/#{TRUSTED_FILE_PATH} (ref main)" if text.to_s.strip.empty?
 
   parsed = begin
     YAML.safe_load(text)

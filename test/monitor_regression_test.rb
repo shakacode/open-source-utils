@@ -294,3 +294,39 @@ class MonitorRegressionTest
     assert_equal ["issue:newissue"], items.map { |item| item[:id] }
   end
 end
+
+class MonitorRegressionTest
+  def test_mid_scan_failure_preserves_success_state_and_reports_blocker
+    writes = []
+    alerts = []
+    @runner.define_singleton_method(:read_state) { { "last_successful_run_at" => "2026-10-31T00:00:00Z" } }
+    @runner.define_singleton_method(:fetch_team_members) { |*_args| [] }
+    @runner.define_singleton_method(:fetch_trusted_actors) { { trusted: [], counts: {} } }
+    @runner.define_singleton_method(:paged_array) do |*_args|
+      [{ "name" => "example", "full_name" => "shakacode/example", "pushed_at" => Time.now.utc.iso8601 }]
+    end
+    @runner.define_singleton_method(:initial_repository_pages) do |*_args|
+      { "shakacode/example" => { "issues" => { "nodes" => [], "pageInfo" => {} }, "pullRequests" => {} } }
+    end
+    @runner.define_singleton_method(:collect_issue_comments) { |*_args| nil }
+    @runner.define_singleton_method(:collect_pull_requests) { |*_args, **_kwargs| raise OpenSourceUtils::RequestBudgetExceeded, "mid-scan budget failure" }
+    @runner.define_singleton_method(:safe_write) { |path, data| writes << [path, data] }
+    @runner.define_singleton_method(:post_slack) { |text| alerts << text; true }
+    previous = ENV.values_at("MONITOR_DRY_RUN", "MONITOR_REPO")
+    begin
+      ENV.delete("MONITOR_DRY_RUN")
+      ENV.delete("MONITOR_REPO")
+      error = assert_raises(SystemExit) { capture_io { @runner.send(:run) } }
+      assert_equal 2, error.status
+      assert_equal [RESULT_PATH], writes.map(&:first)
+      result = writes.last.last
+      refute result[:state_updated]
+      assert_equal "attention_needed", result[:result_status]
+      assert_includes result[:blockers].join, "mid-scan budget failure"
+      assert_equal 1, alerts.length
+      assert_includes alerts.first, 'monitor blocked'
+    ensure
+      ENV["MONITOR_DRY_RUN"], ENV["MONITOR_REPO"] = previous
+    end
+  end
+end

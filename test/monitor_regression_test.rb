@@ -247,3 +247,20 @@ class MonitorRegressionTest
     assert_equal ["pull_review:DISMISSED"], items.map { |item| item[:id] }
   end
 end
+
+class MonitorRegressionTest
+  def test_large_activity_alert_is_split_and_partial_delivery_raises
+    item = { repository: "shakacode/example", activity_type: "review", summary: "a" * 100,
+      link: "https://github.com/shakacode/example/pull/1", author: "outside", outside_because: "outside", suggested_next_action: "review" }
+    messages = []
+    @runner.define_singleton_method(:post_slack) { |text| messages << text; true }
+    @runner.send(:post_activity_messages, Array.new(400, item), @cutoff, @cutoff)
+    assert_operator messages.length, :>, 1
+    assert messages.all? { |message| message.length <= 30_000 }
+    assert_equal 400, messages.sum { |message| message.scan('author: outside').length }
+    calls = 0
+    @runner.define_singleton_method(:post_slack) { |_text| calls += 1; raise "delivery failed" if calls == 2 }
+    assert_raises(RuntimeError) { @runner.send(:post_activity_messages, Array.new(400, item), @cutoff, @cutoff) }
+    assert_equal 2, calls
+  end
+end

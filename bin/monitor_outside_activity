@@ -365,6 +365,18 @@ def build_activity_message(items, start_time, end_time)
   lines.join("\n")
 end
 
+def post_activity_messages(items, start_time, end_time)
+  group = []
+  items.each do |item|
+    if !group.empty? && build_activity_message(group + [item], start_time, end_time).length > 30_000
+      post_slack(build_activity_message(group, start_time, end_time))
+      group = []
+    end
+    group << item
+  end
+  post_slack(build_activity_message(group, start_time, end_time)) unless group.empty?
+end
+
 def collect_issues(owner, repo, full_name, start_time, trusted, reported_ids, items)
   encoded = CGI.escape(repo)
   issues = paged_array("/repos/#{owner}/#{encoded}/issues?state=all&since=#{CGI.escape(start_time.iso8601)}")
@@ -756,7 +768,7 @@ def run
 
   if !diagnostic && blockers.empty? && items.any?
     begin
-      post_slack(build_activity_message(items, start_time, ended_at))
+      post_activity_messages(items, start_time, ended_at)
       slack_sent = true
     rescue StandardError => e
       slack_error = e.message

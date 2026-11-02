@@ -470,7 +470,7 @@ def collect_pull_requests(owner, repo, full_name, start_time, trusted, reported_
           pullRequests(first:100#{", after: \"#{gq(after)}\"" if after}, orderBy:{field:CREATED_AT,direction:DESC}) {
             nodes {
               id number title url createdAt author { login __typename }
-              reviews(first:10) {
+              reviews(first:30) {
                 nodes { id state submittedAt url author { login __typename } }
                 pageInfo { hasNextPage endCursor }
               }

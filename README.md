@@ -45,8 +45,8 @@ The runner applies several layers of protection before scanning:
   within the last 365 days
 - skip the Discussions GraphQL query unless the repository advertises that
   Discussions are enabled
-- request pull requests newest-first and stop pagination at the scan-window
-  cutoff
+- batch pull requests and reviews through GraphQL, visiting every PR so new
+  reviews on older or maintainer-authored PRs are included
 - stop immediately on GitHub rate-limit responses instead of retrying them
 - estimate the minimum scan cost after discovery and abort before scanning if
   the eligible set cannot fit inside the remaining budget
@@ -61,6 +61,9 @@ The defaults can be tightened for diagnostics:
 | `MONITOR_ACTIVE_REPO_DAYS` | `365` | Maximum repository inactivity before it is skipped |
 | `MONITOR_MAX_API_REQUESTS` | `600` | Hard request ceiling for the run |
 | `MONITOR_REPO` | unset | Force one exact repository for a bounded diagnostic run |
+
+Filtered `MONITOR_REPO` diagnostics do not send activity alerts or advance the shared
+success watermark. Their result records `diagnostic: true`.
 
 The current ShakaCode catalog has about 200 public, non-archived repositories.
 The 12-month activity filter selects about 100, and only a handful currently

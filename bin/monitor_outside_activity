@@ -92,7 +92,9 @@ def graphql_query(query, variables = {})
   variables.each do |key, value|
     args << "-f" << "#{key}=#{value}"
   end
-  gh_json(*args)
+  data = gh_json(*args)
+  raise "GraphQL errors: #{data['errors'].to_json}" if data['errors']&.any?
+  data
 end
 
 def parse_time(value)
@@ -102,15 +104,15 @@ rescue StandardError
 end
 
 def gq(value)
-  value.to_s.gsub("\\", "\\\\").gsub("\"", "\\\"")
+  JSON.generate(value.to_s)[1...-1]
 end
 
 def actor_login(actor)
-  actor && actor["login"].to_s
+  (actor || {})["login"].to_s
 end
 
 def actor_type(actor)
-  actor && (actor["type"] || actor["__typename"]).to_s
+  ((actor || {})["type"] || (actor || {})["__typename"]).to_s
 end
 
 def outside_because(actor)
@@ -241,7 +243,8 @@ def fetch_team_members
   end
 
   members.reject(&:empty?).uniq
-rescue StandardError
+rescue StandardError => e
+  raise if e.is_a?(OpenSourceUtils::RequestBudgetExceeded) || OpenSourceUtils::MonitorSupport.rate_limit_error?(e.message)
   paged_array("/orgs/#{ORG}/teams/#{TEAM}/members").map { |member| parse_login(member["login"]) }
 end
 
@@ -251,11 +254,7 @@ def fetch_trusted_actors
   text = with_retries { fetch_trusted_actors_raw } if text.to_s.strip.empty?
   raise "trusted actors file unavailable or empty: #{ORG}/#{TRUSTED_REPO}/#{TRUSTED_FILE_PATH} (ref main)" if text.to_s.strip.empty?
 
-  parsed = begin
-    YAML.safe_load(text)
-  rescue StandardError
-    YAML.load(text)
-  end
+  parsed = YAML.safe_load(text, aliases: true)
   raise "trusted actors file content could not be parsed" unless parsed.is_a?(Hash) || parsed.is_a?(Array)
 
   users = parsed.is_a?(Hash) ? Array(parsed["trusted_users"]).map { |v| parse_login(v) }.reject(&:empty?) : []
@@ -265,7 +264,7 @@ def fetch_trusted_actors
   extras = parsed.is_a?(Hash) ? parse_yaml_values(parsed["trusted_actors"]) : parse_yaml_values(parsed)
   extras = extras.map { |v| parse_login(v) }.reject(&:empty?)
 
-  all = (users + bots + metadata_bots + teams + extras + parse_yaml_values(parsed)).map { |v| parse_login(v) }.reject(&:empty?).uniq
+  all = (users + bots + metadata_bots + teams + extras).map { |v| parse_login(v) }.reject(&:empty?).uniq
 
   {
     users: users,
@@ -298,7 +297,8 @@ def fetch_trusted_actors_graphql
 
   data = graphql_query(query)
   data.dig("data", "repository", "object", "text").to_s
-rescue StandardError
+rescue StandardError => e
+  raise if e.is_a?(OpenSourceUtils::RequestBudgetExceeded) || OpenSourceUtils::MonitorSupport.rate_limit_error?(e.message)
   nil
 end
 
@@ -307,7 +307,8 @@ def fetch_trusted_actors_rest
   return nil if !payload.is_a?(Hash) || payload["encoding"].to_s != "base64" || payload["content"].to_s.strip.empty?
 
   Base64.decode64(payload["content"].to_s.delete(" \n\r\t")).strip
-rescue StandardError
+rescue StandardError => e
+  raise if e.is_a?(OpenSourceUtils::RequestBudgetExceeded) || OpenSourceUtils::MonitorSupport.rate_limit_error?(e.message)
   nil
 end
 
@@ -317,11 +318,14 @@ def fetch_trusted_actors_raw
   return nil if raw_url.empty?
 
   uri = URI(raw_url)
+  REQUEST_BUDGET.consume!
   response = Net::HTTP.get_response(uri)
+  raise "GitHub raw HTTP 429 rate limit" if response.code.to_i == 429
   return nil unless response.is_a?(Net::HTTPSuccess)
 
   response.body.to_s.strip
-rescue StandardError
+rescue StandardError => e
+  raise if e.is_a?(OpenSourceUtils::RequestBudgetExceeded) || OpenSourceUtils::MonitorSupport.rate_limit_error?(e.message)
   nil
 end
 
@@ -339,7 +343,7 @@ end
 
 def build_blocked_message(blockers, start_time, end_time)
   lines = [
-    "**Outside GitHub activity monitor blocked**",
+    "*Outside GitHub activity monitor blocked*",
     "Window: #{format_hst(start_time)} to #{format_hst(end_time)}",
     "",
     "*Blocking sources:*"
@@ -357,17 +361,17 @@ def build_activity_message(items, start_time, end_time)
   end
 
   lines = [
-    "**Outside GitHub activity detected**",
+    "*Outside GitHub activity detected*",
     "Window: #{format_hst(start_time)} to #{format_hst(end_time)}",
     "*Items:* #{items.length}",
     ""
   ]
 
   items.each_with_index do |item, index|
-    title = item[:summary].to_s.strip
+    title = CGI.escapeHTML(item[:summary].to_s.strip).gsub("|", "¦")
     title = "#{title[0, 87].rstrip}..." if title.length > 90
 
-    lines << "- #{item[:repository]} · #{item[:activity_type]} · [#{title}](#{item[:link]}) — author: #{item[:author]}"
+    lines << "- #{item[:repository]} · #{item[:activity_type]} · <#{item[:link]}|#{title}> — author: #{item[:author]}"
     lines << "  Outside because: #{sentence.call(item[:outside_because])}"
     lines << "  Suggested action: #{sentence.call(item[:suggested_next_action])}"
     lines << "" unless index == items.length - 1
@@ -412,11 +416,7 @@ def collect_issue_comments(owner, repo, full_name, start_time, trusted, reported
     cache_key = "#{full_name}:#{issue_number}"
     issue = issue_cache[cache_key]
     unless issue
-      begin
-        issue = gh_json("/repos/#{owner}/#{encoded}/issues/#{issue_number}")
-      rescue StandardError
-        issue = {}
-      end
+      issue = gh_json("/repos/#{owner}/#{encoded}/issues/#{issue_number}")
       issue_cache[cache_key] = issue
     end
 
@@ -438,9 +438,9 @@ def collect_issue_comments(owner, repo, full_name, start_time, trusted, reported
   end
 end
 
-def collect_pr_reviews(owner, repo, pr_number, title, start_time, trusted, reported_ids, items)
+def collect_pr_reviews(owner, repo, pr_number, title, start_time, trusted, reported_ids, items, reviews: nil)
   encoded = CGI.escape(repo)
-  reviews = paged_array("/repos/#{owner}/#{encoded}/pulls/#{pr_number}/reviews")
+  reviews ||= paged_array("/repos/#{owner}/#{encoded}/pulls/#{pr_number}/reviews")
 
   reviews.each do |review|
     next unless (submitted = parse_time(review["submitted_at"])) && submitted >= start_time
@@ -466,35 +466,51 @@ def collect_pr_reviews(owner, repo, pr_number, title, start_time, trusted, repor
 end
 
 def collect_pull_requests(owner, repo, full_name, start_time, trusted, reported_ids, items)
-  encoded = CGI.escape(repo)
-  prs = paged_array(
-    "/repos/#{owner}/#{encoded}/pulls?state=all&sort=created&direction=desc",
-    stop_when: ->(pr) { (created = parse_time(pr["created_at"])) && created < start_time }
-  )
-  warn "  #{full_name} pull_requests fetched=#{prs.length}" if ENV["MONITOR_DEBUG"]
+  after = nil
+  loop do
+    # Enumerate every PR: review submission time is independent of PR creation time.
+    # Batch reviews with PRs so the minimum scan still costs one request per repo.
+    query = <<~GRAPHQL
+      query {
+        repository(owner:"#{gq(owner)}",name:"#{gq(repo)}") {
+          pullRequests(first:100#{", after: \"#{gq(after)}\"" if after}, orderBy:{field:CREATED_AT,direction:DESC}) {
+            nodes {
+              id number title url createdAt author { login __typename }
+              reviews(last:100) {
+                nodes { id state submittedAt url author { login __typename } }
+                pageInfo { hasPreviousPage }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      }
+    GRAPHQL
+    connection = graphql_query(query).dig("data", "repository", "pullRequests")
+    raise "pull request data missing for #{full_name}" unless connection
 
-  prs.each do |pr|
-    created = parse_time(pr["created_at"])
-    next unless created && created >= start_time
-    next unless outside_actor?(pr["user"], trusted)
+    Array(connection["nodes"]).each do |pr|
+      actor = pr["author"]
+      if (created = parse_time(pr["createdAt"])) && created >= start_time && outside_actor?(actor, trusted)
+        add_item(items, reported_ids,
+          id: "pull_request:#{pr.fetch('id')}", repository: full_name,
+          activity_type: "new pull request", actor: actor, link: pr["url"],
+          summary: "PR ##{pr['number']}: #{pr['title']}", outside_because: outside_because(actor),
+          action: "Review the PR for maintainability and assign an internal owner.")
+      end
 
-    pr_number = pr.fetch("number")
-    title = pr["title"]
-
-    add_item(
-      items,
-      reported_ids,
-      id: "pull_request:#{pr.fetch("node_id", "#{full_name}:pr:#{pr_number}")}",
-      repository: full_name,
-      activity_type: "new pull request",
-      actor: pr["user"],
-      link: pr["html_url"],
-      summary: "PR ##{pr_number}: #{title}",
-      outside_because: outside_because(pr["user"]),
-      action: "Review the PR for maintainability and assign an internal owner."
-    )
-
-    collect_pr_reviews(owner, repo, pr_number, title, start_time, trusted, reported_ids, items)
+      reviews = pr.fetch("reviews")
+      # A long review history falls back to complete REST pagination.
+      recent_reviews = unless reviews.dig("pageInfo", "hasPreviousPage")
+        reviews.fetch("nodes").map do |review|
+          { "node_id" => review["id"], "id" => review["id"], "state" => review["state"],
+            "submitted_at" => review["submittedAt"], "html_url" => review["url"], "user" => review["author"] }
+        end
+      end
+      collect_pr_reviews(owner, repo, pr["number"], pr["title"], start_time, trusted, reported_ids, items, reviews: recent_reviews)
+    end
+    break unless connection.dig("pageInfo", "hasNextPage")
+    after = connection.dig("pageInfo", "endCursor")
   end
 end
 
@@ -587,8 +603,12 @@ def collect_discussions(owner, repo, start_time, trusted, reported_ids, items)
     break unless repository["hasDiscussionsEnabled"]
 
     discussions = Array(repository.dig("discussions", "nodes"))
+    reached_cutoff = false
     discussions.each do |discussion|
-      break if parse_time(discussion["updatedAt"]) && parse_time(discussion["updatedAt"]) < start_time
+      if parse_time(discussion["updatedAt"]) && parse_time(discussion["updatedAt"]) < start_time
+        reached_cutoff = true
+        break
+      end
 
       actor = discussion["author"]
 
@@ -640,12 +660,13 @@ def collect_discussions(owner, repo, start_time, trusted, reported_ids, items)
       end
     end
 
-    break unless repository.dig("discussions", "pageInfo", "hasNextPage")
+    break if reached_cutoff || !repository.dig("discussions", "pageInfo", "hasNextPage")
     after = repository.dig("discussions", "pageInfo", "endCursor")
   end
 end
 
 def run
+diagnostic = !ENV['MONITOR_REPO'].to_s.empty?
 state = read_state
 state_read = File.exist?(STATE_PATH)
 start_time, ended_at = compute_window(state)
@@ -688,8 +709,8 @@ if blockers.empty?
       !repo["private"] && !repo["archived"] && !repo["disabled"]
     end
 
-    if (repo_filter = ENV["MONITOR_REPO"]).to_s.strip != ""
-      repos = discovered_repos.select { |repo| repo.fetch("full_name", "") == repo_filter }
+    if diagnostic
+      repos = discovered_repos.select { |repo| repo.fetch("full_name", "") == ENV["MONITOR_REPO"].strip }
     else
       repos = discovered_repos.select do |repo|
         OpenSourceUtils::MonitorSupport.active_repository?(repo, activity_cutoff)
@@ -717,7 +738,7 @@ end
 
 items.sort_by! { |item| [item[:repository], item[:activity_type], item[:author], item[:summary]] }
 
-if blockers.empty? && items.any?
+if !diagnostic && blockers.empty? && items.any?
   begin
     post_slack(build_activity_message(items, start_time, ended_at))
     slack_sent = true
@@ -726,7 +747,7 @@ if blockers.empty? && items.any?
   end
 end
 
-if blockers.empty? && (items.empty? || slack_sent)
+if !diagnostic && blockers.empty? && (items.empty? || slack_sent)
   cutoff = ended_at - (REPORT_RETENTION_DAYS * 24 * 60 * 60)
   updated_records = reported_records.dup
   items.each { |item| updated_records[item[:id]] = ended_at }
@@ -780,6 +801,7 @@ result = {
     refresh_status: blockers.empty? ? "ok" : "blocked"
   },
   outside_activity_count: items.length,
+  diagnostic: diagnostic,
   state_read: state_read,
   state_updated: state_updated,
   slack_sent: slack_sent,
@@ -804,7 +826,7 @@ status_label = if blockers.empty? && items.empty?
 else
   "OUTSIDE ACTIVITY: ATTENTION"
 end
-scan_completed = blockers.empty? && (!items.any? || slack_sent)
+scan_completed = blockers.empty? && (diagnostic || !items.any? || slack_sent)
 result[:result_status] = scan_completed ? "completed" : "attention_needed"
 result[:result_summary] = if blockers.empty? && items.empty?
   "No new outside activity found in scan window."
@@ -821,7 +843,7 @@ puts result[:result_summary]
 puts JSON.pretty_generate(result)
 puts status_label
 
-if blockers.any? || (items.any? && !slack_sent)
+if blockers.any? || (!diagnostic && items.any? && !slack_sent)
   exit 2
 else
   exit 0

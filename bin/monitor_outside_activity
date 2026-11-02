@@ -377,9 +377,53 @@ def post_activity_messages(items, start_time, end_time)
   post_slack(build_activity_message(group, start_time, end_time)) unless group.empty?
 end
 
-def collect_issues(owner, repo, full_name, start_time, trusted, reported_ids, items)
-  encoded = CGI.escape(repo)
-  issues = paged_array("/repos/#{owner}/#{encoded}/issues?state=all&since=#{CGI.escape(start_time.iso8601)}")
+def initial_repository_pages(repositories, start_time)
+  fields = repositories.each_with_index.map do |repo, index|
+    <<~GRAPHQL
+      repo#{index}: repository(owner:"#{ORG}",name:"#{gq(repo.fetch('name'))}") {
+        issues(first:100, filterBy:{since:"#{start_time.iso8601}"}) {
+          nodes { id number title url createdAt author { login __typename } }
+          pageInfo { hasNextPage endCursor }
+        }
+        pullRequests(first:50, orderBy:{field:CREATED_AT,direction:DESC}) {
+          nodes { id number title url createdAt author { login __typename }
+            reviews(first:30) { nodes { id state submittedAt url author { login __typename } }
+              pageInfo { hasNextPage endCursor } }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    GRAPHQL
+  end.join(" ")
+  data = graphql_query("query { #{fields} }").fetch("data")
+  repositories.each_with_index.to_h do |repo, index|
+    page = data["repo#{index}"]
+    raise "Repository page missing for #{repo['full_name']}" unless page
+    [repo.fetch('full_name'), page]
+  end
+end
+
+def collect_issues(owner, repo, full_name, start_time, trusted, reported_ids, items, initial_connection:)
+issues = []
+connection = initial_connection
+loop do
+  issues.concat(connection.fetch("nodes"))
+  break unless connection.dig("pageInfo", "hasNextPage")
+  query = <<~GRAPHQL
+    query { repository(owner:"#{gq(owner)}",name:"#{gq(repo)}") {
+      issues(first:100, after:"#{gq(connection.dig('pageInfo', 'endCursor'))}", filterBy:{since:"#{start_time.iso8601}"}) {
+        nodes { id number title url createdAt author { login __typename } }
+        pageInfo { hasNextPage endCursor }
+      }
+    } }
+  GRAPHQL
+  connection = graphql_query(query).dig("data", "repository", "issues")
+  raise "Issue page missing for #{full_name}" unless connection
+end
+issues = issues.map do |issue|
+  { "node_id" => issue["id"], "number" => issue["number"], "created_at" => issue["createdAt"],
+    "user" => issue["author"], "html_url" => issue["url"], "title" => issue["title"] }
+end
 
   issues.each do |issue|
     next if issue["pull_request"]
@@ -471,7 +515,7 @@ def collect_graphql_reviews(owner, repo, pr, connection, start_time, trusted, re
   collect_pr_reviews(owner, repo, pr["number"], pr["title"], start_time, trusted, reported_ids, items, reviews: reviews)
 end
 
-def collect_pull_requests(owner, repo, full_name, start_time, trusted, reported_ids, items)
+def collect_pull_requests(owner, repo, full_name, start_time, trusted, reported_ids, items, initial_connection: nil)
   after = nil
   loop do
     # Enumerate every PR: review submission time is independent of PR creation time.
@@ -492,7 +536,8 @@ def collect_pull_requests(owner, repo, full_name, start_time, trusted, reported_
         }
       }
     GRAPHQL
-    connection = graphql_query(query).dig("data", "repository", "pullRequests")
+    connection = initial_connection || graphql_query(query).dig("data", "repository", "pullRequests")
+    initial_connection = nil
     raise "pull request data missing for #{full_name}" unless connection
 
     Array(connection["nodes"]).each do |pr|
@@ -748,17 +793,20 @@ def run
       minimum_scan_requests = OpenSourceUtils::MonitorSupport.minimum_scan_requests(repos)
       REQUEST_BUDGET.ensure_capacity!(minimum_scan_requests)
 
-      repos.each_with_index do |repo, index|
-        name = repo.fetch("name")
-        full_name = repo.fetch("full_name")
-        warn "scanning #{index + 1}/#{repos.length} #{full_name}"
-
-        collect_issues(ORG, name, full_name, start_time, trusted, reported_ids, items)
-        collect_issue_comments(ORG, name, full_name, start_time, trusted, reported_ids, items, issue_cache)
-        collect_pull_requests(ORG, name, full_name, start_time, trusted, reported_ids, items)
-        collect_pull_review_comments(ORG, name, full_name, start_time, trusted, reported_ids, items)
-        collect_discussions(ORG, name, start_time, trusted, reported_ids, items) if repo["has_discussions"]
-      end
+repos.each_slice(2).with_index do |group, group_index|
+  pages = initial_repository_pages(group, start_time)
+  group.each_with_index do |repo, index|
+    name = repo.fetch("name")
+    full_name = repo.fetch("full_name")
+    warn "scanning #{group_index * 2 + index + 1}/#{repos.length} #{full_name} (requests=#{REQUEST_BUDGET.used})"
+    page = pages.fetch(full_name)
+    collect_issues(ORG, name, full_name, start_time, trusted, reported_ids, items, initial_connection: page.fetch('issues'))
+    collect_issue_comments(ORG, name, full_name, start_time, trusted, reported_ids, items, issue_cache)
+    collect_pull_requests(ORG, name, full_name, start_time, trusted, reported_ids, items, initial_connection: page.fetch('pullRequests'))
+    collect_pull_review_comments(ORG, name, full_name, start_time, trusted, reported_ids, items)
+    collect_discussions(ORG, name, start_time, trusted, reported_ids, items) if repo["has_discussions"]
+  end
+end
     rescue StandardError => e
       blockers << "scan failed: #{e.message}"
     end

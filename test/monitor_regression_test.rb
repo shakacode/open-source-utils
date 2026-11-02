@@ -185,7 +185,8 @@ class MonitorRegressionTest
     @runner.define_singleton_method(:paged_array) do |*_args|
       [{ "name" => "example", "full_name" => "shakacode/example", "pushed_at" => Time.now.utc.iso8601 }]
     end
-    @runner.define_singleton_method(:collect_issues) do |*_args|
+    @runner.define_singleton_method(:initial_repository_pages) { |*_args| { "shakacode/example" => { "issues" => {}, "pullRequests" => {} } } }
+    @runner.define_singleton_method(:collect_issues) do |*_args, **_kwargs|
       _args.last << { repository: "shakacode/example", activity_type: "new issue", author: "outside", summary: "issue" }
     end
     %i[collect_issue_comments collect_pull_requests collect_pull_review_comments].each do |method|
@@ -262,5 +263,34 @@ class MonitorRegressionTest
     @runner.define_singleton_method(:post_slack) { |_text| calls += 1; raise "delivery failed" if calls == 2 }
     assert_raises(RuntimeError) { @runner.send(:post_activity_messages, Array.new(400, item), @cutoff, @cutoff) }
     assert_equal 2, calls
+  end
+end
+
+class MonitorRegressionTest
+  def test_initial_issue_and_pr_pages_are_shared_between_two_repositories
+    query = nil
+    @runner.define_singleton_method(:graphql_query) do |value|
+      query = value
+      { "data" => { "repo0" => { "issues" => { "nodes" => [] }, "pullRequests" => {} }, "repo1" => { "issues" => {}, "pullRequests" => {} } } }
+    end
+    repos = %w[first second].map { |name| { "name" => name, "full_name" => "shakacode/#{name}" } }
+    pages = @runner.send(:initial_repository_pages, repos, @cutoff)
+    assert_equal %w[shakacode/first shakacode/second], pages.keys
+    assert_includes query, 'repo0: repository'
+    assert_includes query, 'repo1: repository'
+    assert_includes query, 'issues(first:100, filterBy:{since:'
+    assert_includes query, 'pullRequests(first:50'
+  end
+
+  def test_issue_pagination_filters_by_own_creation_and_actor
+    issue = { "id" => "newissue", "number" => 2, "title" => "New issue", "url" => "https://github.com/shakacode/example/issues/2",
+      "createdAt" => @cutoff.iso8601, "author" => { "login" => "outside", "__typename" => "User" } }
+    first = { "nodes" => [issue.merge("id" => "oldissue", "createdAt" => "2020-01-01T00:00:00Z")], "pageInfo" => { "hasNextPage" => true, "endCursor" => "next" } }
+    @runner.define_singleton_method(:graphql_query) do |_query|
+      { "data" => { "repository" => { "issues" => { "nodes" => [issue], "pageInfo" => {} } } } }
+    end
+    items = []
+    @runner.send(:collect_issues, "shakacode", "example", "shakacode/example", @cutoff, Set.new, Set.new, items, initial_connection: first)
+    assert_equal ["issue:newissue"], items.map { |item| item[:id] }
   end
 end

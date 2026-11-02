@@ -45,7 +45,7 @@ module OpenSourceUtils
     end
 
     def minimum_scan_requests(repositories)
-      repositories.sum { |repository| 4 + (repository["has_discussions"] ? 1 : 0) }
+      repositories.length * 2 + (repositories.length + 1) / 2 + repositories.count { |repository| repository["has_discussions"] }
     end
 
     def paged_array(path, fetcher:, stop_when: nil)

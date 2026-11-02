@@ -70,7 +70,7 @@ class MonitorSupportTest < Minitest::Test
       { "has_discussions" => true }
     ]
 
-    assert_equal 9, OpenSourceUtils::MonitorSupport.minimum_scan_requests(repositories)
+    assert_equal 6, OpenSourceUtils::MonitorSupport.minimum_scan_requests(repositories)
   end
 
   def test_rate_limit_errors_are_not_retryable
